@@ -85,17 +85,13 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
     let conn_d = conn.clone();
     tokio::spawn(async move {
         let mut reasm = FragmentReassembler::new();
-        loop {
-            match conn_d.read_datagram().await {
-                Ok(data) => match reasm.push(data) {
-                    Ok(Some((_sid, addr, payload))) => {
-                        // Best-effort: log; full demux needs local UDP map
-                        info!("udp response from {} len={}", addr.to_socket_addr_string(), payload.len());
-                    }
-                    Ok(None) => {}
-                    Err(e) => warn!("client reassembly: {e}"),
-                },
-                Err(_) => break,
+        while let Ok(data) = conn_d.read_datagram().await {
+            match reasm.push(data) {
+                Ok(Some((_sid, addr, payload))) => {
+                    info!("udp response from {} len={}", addr.to_socket_addr_string(), payload.len());
+                }
+                Ok(None) => {}
+                Err(e) => warn!("client reassembly: {e}"),
             }
         }
     });

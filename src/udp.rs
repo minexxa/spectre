@@ -55,11 +55,8 @@ impl FragSlot {
         if self.parts.len() == self.total as usize {
             let mut out = BytesMut::new();
             for i in 0..self.total {
-                if let Some(p) = self.parts.remove(&i) {
-                    out.extend_from_slice(&p);
-                } else {
-                    return None;
-                }
+                let p = self.parts.remove(&i)?;
+                out.extend_from_slice(&p);
             }
             Some((self.address.clone(), out.freeze()))
         } else {
@@ -337,7 +334,7 @@ pub async fn send_udp_over_quic(
     let frames = fragment_udp(session_id, packet_id, address, payload, max_datagram);
     for frame in frames {
         conn.send_datagram(frame).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("send_datagram: {e}"))
+            std::io::Error::other(format!("send_datagram: {e}"))
         })?;
     }
     Ok(())

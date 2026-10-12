@@ -205,10 +205,7 @@ async fn handle_proxy_stream(
     match cmd {
         Command::TcpConnect => {
             let mut rest = vec![0u8; 1024];
-            let n = match recv.read(&mut rest).await? {
-                Some(n) => n,
-                None => 0,
-            };
+            let n: usize = recv.read(&mut rest).await?.unwrap_or_default();
             let mut buf = BytesMut::from(&rest[..n]);
             let req = TcpConnectRequest::decode(&mut buf)?;
             info!("TCP CONNECT {}", req.address.to_socket_addr_string());
@@ -312,22 +309,19 @@ async fn handle_udp_datagram(
 
     // Read response(s) briefly — non-blocking style with timeout
     let mut buf = vec![0u8; 65535];
-    match tokio::time::timeout(Duration::from_millis(50), sock.recv_from(&mut buf)).await {
-        Ok(Ok((n, from))) => {
-            let resp_addr = Address::new(from.ip().to_string(), from.port());
-            let pid = packet_id.fetch_add(1, Ordering::Relaxed);
-            let frames = fragment_udp(
-                session_id,
-                pid,
-                &resp_addr,
-                &buf[..n],
-                DEFAULT_MAX_DATAGRAM_PAYLOAD,
-            );
-            for frame in frames {
-                let _ = conn.send_datagram(frame);
-            }
+    if let Ok(Ok((n, from))) = tokio::time::timeout(Duration::from_millis(50), sock.recv_from(&mut buf)).await {
+        let resp_addr = Address::new(from.ip().to_string(), from.port());
+        let pid = packet_id.fetch_add(1, Ordering::Relaxed);
+        let frames = fragment_udp(
+            session_id,
+            pid,
+            &resp_addr,
+            &buf[..n],
+            DEFAULT_MAX_DATAGRAM_PAYLOAD,
+        );
+        for frame in frames {
+            let _ = conn.send_datagram(frame);
         }
-        _ => {}
     }
 
     // Spawn a long-lived reader for this session if not already
