@@ -1,6 +1,7 @@
 //! Spectre client — QUIC + JLS (rustls-jls / quinn-jls).
 
-use crate::brutal::{BrutalConfig, BrutalPacer};
+use crate::brutal::{bind_udp, tune_transport, BrutalHandle};
+use crate::relay::relay;
 use crate::protocol::*;
 use crate::udp::{
     fragment_udp, FragmentReassembler, DEFAULT_MAX_DATAGRAM_PAYLOAD,
@@ -28,7 +29,16 @@ pub struct ClientConfigYaml {
 }
 
 pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
-    let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    // Large UDP socket buffers: drops in the kernel would look like network
+    // loss to Brutal.
+    let bind_addr: SocketAddr = if cfg.server.is_ipv6() {
+        "[::]:0".parse()?
+    } else {
+        "0.0.0.0:0".parse()?
+    };
+    let socket = bind_udp(bind_addr).context("bind udp socket")?;
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
+    let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
     endpoint.set_default_client_config(configure_client(&cfg)?);
 
     info!("connecting to {} (SNI={})", cfg.server, cfg.server_name);
@@ -62,8 +72,10 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
         "auth success, negotiated rates rx={} tx={}",
         resp.rx_bps, resp.tx_bps
     );
-
-    let rates = Arc::new((cfg.tx_bps, cfg.rx_bps)); // (upload, download)
+    info!(
+        "Brutal: upload {} B/s, download {} B/s (0 = BBR)",
+        cfg.tx_bps, cfg.rx_bps
+    );
 
     // TCP local proxy
     let listener = TcpListener::bind(cfg.listen).await?;
@@ -99,9 +111,8 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
     loop {
         let (local, peer) = listener.accept().await?;
         let conn = conn.clone();
-        let rates = Arc::clone(&rates);
         tokio::spawn(async move {
-            if let Err(e) = handle_local(local, peer, conn, rates).await {
+            if let Err(e) = handle_local(local, peer, conn).await {
                 warn!("local connection error: {e:#}");
             }
         });
@@ -294,7 +305,6 @@ async fn handle_local(
     mut local: TcpStream,
     peer: SocketAddr,
     conn: quinn::Connection,
-    rates: Arc<(u64, u64)>,
 ) -> Result<()> {
     // Read enough for HTTP headers (up to 8 KiB or until blank line)
     let mut header = vec![0u8; 8192];
@@ -355,52 +365,12 @@ async fn handle_local(
         send.write_all(&req_local.pending).await?;
     }
 
-    let (tx_bps, rx_bps) = *rates;
-    let mut pacer_up = if tx_bps > 0 {
-        Some(BrutalPacer::new(BrutalConfig::from_bps(tx_bps)))
-    } else {
-        None
-    };
-    let mut pacer_down = if rx_bps > 0 {
-        Some(BrutalPacer::new(BrutalConfig::from_bps(rx_bps)))
-    } else {
-        None
-    };
-
-    let (mut local_r, mut local_w) = local.into_split();
-    let up = async {
-        let mut buf = vec![0u8; 32 * 1024];
-        loop {
-            let n = local_r.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            if let Some(ref mut p) = pacer_up {
-                p.write_all_paced(&mut send, &buf[..n]).await?;
-            } else {
-                send.write_all(&buf[..n]).await?;
-            }
-        }
-        Ok::<(), std::io::Error>(())
-    };
-    let down = async {
-        let mut buf = vec![0u8; 32 * 1024];
-        loop {
-            let n = match recv.read(&mut buf).await? {
-                Some(n) if n > 0 => n,
-                _ => break,
-            };
-            if let Some(ref mut p) = pacer_down {
-                p.write_all_paced(&mut local_w, &buf[..n]).await?;
-            } else {
-                local_w.write_all(&buf[..n]).await?;
-            }
-        }
-        Ok::<(), std::io::Error>(())
-    };
-    tokio::select! {
-        r = up => { let _ = r; }
-        r = down => { let _ = r; }
+    // Rate control is done by the QUIC congestion controller (Brutal), so this
+    // is a plain full-duplex byte relay.
+    let _ = local.set_nodelay(true);
+    let (local_r, local_w) = local.into_split();
+    if let Err(e) = relay(recv, send, local_r, local_w).await {
+        info!("relay ended: {e}");
     }
     Ok(())
 }
@@ -417,6 +387,9 @@ fn configure_client(cfg: &ClientConfigYaml) -> Result<quinn::ClientConfig> {
     transport.max_concurrent_bidi_streams(4096u32.into());
     transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
     transport.datagram_send_buffer_size(2 * 1024 * 1024);
+    // Client -> server traffic is the client's upload: send at `tx_bps`.
+    // The server applies the client's `rx_bps` to its own sender after auth.
+    tune_transport(&mut transport, BrutalHandle::new(cfg.tx_bps));
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));

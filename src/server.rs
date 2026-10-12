@@ -1,6 +1,7 @@
 //! Spectre server — QUIC + JLS (rustls-jls / quinn-jls).
 
-use crate::brutal::{BrutalConfig, BrutalPacer};
+use crate::brutal::{bind_udp, tune_transport, BrutalHandle};
+use crate::relay::relay;
 use crate::protocol::*;
 use crate::udp::{
     fragment_udp, get_or_create_session, gc_sessions, new_session_table, resolve_address,
@@ -46,17 +47,22 @@ pub async fn run_server(cfg: ServerConfigYaml) -> Result<()> {
         .context("failed to build tls ServerConfig")?;
     server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"spectre".to_vec()];
 
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(4096u32.into());
-    transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
-    transport.datagram_send_buffer_size(2 * 1024 * 1024);
-
     let quic_server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
         .context("QuicServerConfig")?;
+    // Base config (Brutal off). Each connection gets its own copy with its own
+    // rate handle, which is set after authentication.
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
-    server_config.transport_config(Arc::new(transport));
+    server_config.transport_config(make_transport(BrutalHandle::new(0)));
+    let base_config = Arc::new(server_config);
 
-    let endpoint = quinn::Endpoint::server(server_config, cfg.listen)?;
+    let socket = bind_udp(cfg.listen).context("bind udp socket")?;
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some((*base_config).clone()),
+        socket,
+        runtime,
+    )?;
     info!(
         "Spectre server (JLS) listening on {}  sni={} upstream={}",
         cfg.listen, server_name, upstream
@@ -65,11 +71,12 @@ pub async fn run_server(cfg: ServerConfigYaml) -> Result<()> {
     let password = Arc::new(password);
     let username = Arc::new(username);
 
-    while let Some(connecting) = endpoint.accept().await {
+    while let Some(incoming) = endpoint.accept().await {
         let password = Arc::clone(&password);
         let username = Arc::clone(&username);
+        let base_config = Arc::clone(&base_config);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connecting, password, username).await {
+            if let Err(e) = handle_connection(incoming, base_config, password, username).await {
                 error!("connection error: {e:#}");
             }
         });
@@ -77,12 +84,33 @@ pub async fn run_server(cfg: ServerConfigYaml) -> Result<()> {
     Ok(())
 }
 
+/// Transport config shared by all connections: stream limits, datagram
+/// buffers, large flow-control windows and the Brutal controller bound to
+/// `handle`.
+fn make_transport(handle: BrutalHandle) -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(4096u32.into());
+    transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
+    transport.datagram_send_buffer_size(2 * 1024 * 1024);
+    tune_transport(&mut transport, handle);
+    Arc::new(transport)
+}
+
 async fn handle_connection(
-    connecting: quinn::Incoming,
+    incoming: quinn::Incoming,
+    base_config: Arc<quinn::ServerConfig>,
     password: Arc<String>,
     username: Arc<String>,
 ) -> Result<()> {
-    let conn = connecting.await.context("handshake failed")?;
+    // Per-connection config so this connection has its own Brutal rate handle.
+    let rate = BrutalHandle::new(0);
+    let mut conn_config = (*base_config).clone();
+    conn_config.transport_config(make_transport(rate.clone()));
+    let conn = incoming
+        .accept_with(Arc::new(conn_config))
+        .context("accept connection")?
+        .await
+        .context("handshake failed")?;
     let remote = conn.remote_address();
     info!("new connection from {remote}");
 
@@ -126,12 +154,10 @@ async fn handle_connection(
     send.write_all(&resp.encode()).await?;
     let _ = send.finish();
 
-    let rates = Arc::new(ConnectionRates {
-        // server -> client (download for client)
-        to_client_bps: auth_req.rx_bps,
-        // client -> server (upload for client)
-        from_client_bps: auth_req.tx_bps,
-    });
+    // Server -> client traffic is the client's download: send at the client's
+    // declared rx rate. 0 keeps the BBR fallback. The client's own upload rate
+    // (tx) is enforced by the client's controller.
+    rate.set(auth_req.rx_bps);
 
     let sessions = new_session_table();
     let packet_id = Arc::new(AtomicU16::new(1));
@@ -152,9 +178,8 @@ async fn handle_connection(
             bi = conn.accept_bi() => {
                 match bi {
                     Ok((s, r)) => {
-                        let rates = Arc::clone(&rates);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_proxy_stream(s, r, rates).await {
+                            if let Err(e) = handle_proxy_stream(s, r).await {
                                 warn!("proxy stream error: {e:#}");
                             }
                         });
@@ -186,17 +211,11 @@ async fn handle_connection(
     Ok(())
 }
 
-struct ConnectionRates {
-    to_client_bps: u64,
-    from_client_bps: u64,
-}
-
 async fn handle_proxy_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    rates: Arc<ConnectionRates>,
 ) -> Result<()> {
-        let mut header = [0u8; 1];
+    let mut header = [0u8; 1];
     if recv.read_exact(&mut header).await.is_err() {
         return Ok(());
     }
@@ -215,52 +234,12 @@ async fn handle_proxy_stream(
                     let resp = TcpConnectResponse::ok();
                     send.write_all(&resp.encode()).await?;
 
-                    let (mut tcp_r, mut tcp_w) = tcp.into_split();
-                    let mut pacer_up = if rates.from_client_bps > 0 {
-                        Some(BrutalPacer::new(BrutalConfig::from_bps(rates.from_client_bps)))
-                    } else {
-                        None
-                    };
-                    let mut pacer_down = if rates.to_client_bps > 0 {
-                        Some(BrutalPacer::new(BrutalConfig::from_bps(rates.to_client_bps)))
-                    } else {
-                        None
-                    };
-
-                    let up = async {
-                        let mut buf = vec![0u8; 32 * 1024];
-                        loop {
-                            // quinn RecvStream::read -> Result<Option<usize>>
-                            let n = match recv.read(&mut buf).await? {
-                                Some(n) if n > 0 => n,
-                                _ => break,
-                            };
-                            if let Some(ref mut p) = pacer_up {
-                                p.write_all_paced(&mut tcp_w, &buf[..n]).await?;
-                            } else {
-                                                                tcp_w.write_all(&buf[..n]).await?;
-                            }
-                        }
-                        Ok::<(), std::io::Error>(())
-                    };
-                    let down = async {
-                                                let mut buf = vec![0u8; 32 * 1024];
-                        loop {
-                            let n = tcp_r.read(&mut buf).await?;
-                            if n == 0 {
-                                break;
-                            }
-                            if let Some(ref mut p) = pacer_down {
-                                p.write_all_paced(&mut send, &buf[..n]).await?;
-                            } else {
-                                                                send.write_all(&buf[..n]).await?;
-                            }
-                        }
-                        Ok::<(), std::io::Error>(())
-                    };
-                    tokio::select! {
-                        r = up => { let _ = r; }
-                        r = down => { let _ = r; }
+                    let _ = tcp.set_nodelay(true);
+                    let (tcp_r, tcp_w) = tcp.into_split();
+                    // Rate control is done by the QUIC congestion controller,
+                    // so this is a plain full-duplex byte relay.
+                    if let Err(e) = relay(recv, send, tcp_r, tcp_w).await {
+                        info!("relay ended: {e}");
                     }
                 }
                 Err(e) => {

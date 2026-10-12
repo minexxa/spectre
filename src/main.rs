@@ -35,9 +35,11 @@ enum Commands {
         username: String,
         #[arg(short, long, default_value = "127.0.0.1:1080")]
         listen: SocketAddr,
-        #[arg(long, default_value = "0")]
+        /// Download rate, e.g. `200mbps` (bits/s) or `25000000` (bytes/s). 0 = BBR.
+        #[arg(long, default_value = "0", value_parser = spectre::brutal::parse_rate)]
         rx: u64,
-        #[arg(long, default_value = "0")]
+        /// Upload rate, e.g. `50mbps` (bits/s) or `6250000` (bytes/s). 0 = BBR.
+        #[arg(long, default_value = "0", value_parser = spectre::brutal::parse_rate)]
         tx: u64,
         /// Optional local UDP listen address for datagram proxy
         #[arg(long)]
