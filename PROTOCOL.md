@@ -32,7 +32,17 @@
 3. If authentication succeeds → the QUIC connection becomes a Spectre proxy session.
 4. If authentication fails (or is absent) → the server transparently forwards the TCP/UDP flow to a configured **upstream camouflage target** (e.g. a real website). Active probers only see a normal website response.
 
-> Current implementation uses a simplified control-stream auth + self-signed/ephemeral certs as a stepping stone. Full rustls-jls / quinn-jls integration is planned.
+### How JLS authenticates
+
+- Client: `ClientHello.random = AES-256-GCM(key = SHA256(pwd || CH), nonce = SHA256(iv || CH), plaintext = 16 random bytes)`.
+  `CH` is the whole ClientHello with `random` zeroed (and PSK binders zeroed), so the value is bound to the SNI and key share.
+  The 32-byte output is 16 bytes of ciphertext plus a 16-byte tag, which looks like ordinary random.
+- Server: decrypts and checks the tag with each configured user. SNI must also equal `upstream_sni`.
+- Server replies with `ServerHello.random` built the same way over the ServerHello bytes, so the client knows the server holds the secret.
+- On success both sides skip certificate-chain and signature verification, which is why no CA certificate is needed.
+- On failure the server never answers; the QUIC layer forwards the packets to the upstream site.
+- HelloRetryRequest is illegal on a JLS connection.
+- ALPN is `h3` only.
 
 ## Framing (after successful auth)
 
@@ -93,18 +103,22 @@ A control bidirectional stream (cmd = 0x02) may be used to negotiate session lif
 
 ## Congestion Control — Brutal Mode
 
-During (or right after) authentication the client may declare:
+The client declares in AUTH:
 
-- `tx_bps` — desired upload rate (bytes/sec)
-- `rx_bps` — desired download rate (bytes/sec)
+- `tx_bps` — its upload rate (bytes/sec); the client's sender uses it.
+- `rx_bps` — its download rate (bytes/sec); the server's sender uses it after AUTH succeeds.
 
-Semantics (inspired by Hysteria Brutal):
+Sender behaviour (implemented as a quinn `congestion::Controller`):
 
-- When a non-zero target rate is set, the sender **ignores classic loss-based backoff** and tries to maintain the target rate, compensating loss by retransmission.
-- Rate 0 → fall back to standard BBR / Cubic.
-- Server may also return its preferred rates.
-
-Implementation note: custom `quinn::congestion::Controller` that implements a token-bucket / pacing at the target rate.
+- `ack_rate = acked / (acked + lost)` over a sliding 5 x 1 s window, floored at 0.8
+  and ignored until about 60 KB has been observed.
+- `cwnd = rate * srtt * 1.2 / ack_rate`. quinn's pacer then paces at about
+  `cwnd * 1.25 / srtt`. Loss is repaired by QUIC retransmission, and dividing by
+  `ack_rate` keeps goodput near `rate`.
+- Loss does not shrink the window below `rate * srtt * 1.2 / 0.8`.
+- Rate 0 falls back to BBR.
+- Flow-control windows are raised (16 MiB per stream, 64 MiB per connection), because
+  the defaults cap throughput at about 1.2 MB per RTT regardless of congestion control.
 
 ## Padding & Obfuscation
 

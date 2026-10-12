@@ -26,7 +26,7 @@ MSRV: **Rust 1.80+**
 - [x] Server + client using **quinn-jls / rustls-jls**
 - [x] TCP proxying over QUIC bidirectional streams
 - [x] GitHub Actions release builds (Linux gnu/musl, aarch64, Windows)
-- [ ] Full `JlsServerConfig` field wiring for automatic probe → upstream TCP forward (hooks prepared)
+- [x] JLS wiring: certificate-less authentication, unauthenticated QUIC traffic is forwarded to the real upstream site
 - [x] Brutal congestion controller (quinn `Controller`, Hysteria2-style ack-rate compensation) plugged into `TransportConfig`
 - [ ] Complete UDP session table & fragment reassembly
 - [ ] SOCKS5 inbound on client
@@ -69,6 +69,18 @@ sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
 ```
 
 Client accepts `CONNECT host:port` (HTTP proxy style) or a bare `host:port` line.
+
+## Camouflage (JLS)
+
+- `--password` / `--username` are the JLS secret (`user_pwd` / `user_iv`) and must match on both ends.
+- The client's `--server-name` is the SNI it sends. It must equal the server's `--server-name`,
+  and should be the host of `--upstream`, or the server treats the client as unauthenticated.
+- `--upstream` must be a real site that speaks **HTTP/3 on UDP**, for example `www.cloudflare.com:443`.
+  Packets from anyone who fails JLS (probers, scanners, wrong SNI) are forwarded there unchanged.
+- No CA certificate is needed. The server uses a throwaway self-signed certificate that JLS clients never validate.
+  The client trusts no CA at all, so anything that is not your server (including a MITM) is rejected.
+- Known limit: JLS has no replay protection. A censor that replays a captured ClientHello gets a
+  ServerHello from your server instead of the real site's.
 
 ## CI
 
