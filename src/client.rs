@@ -54,7 +54,7 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
         .read(&mut buf)
         .await?
         .ok_or_else(|| anyhow!("no auth response"))?;
-    let mut reader = &buf[..n];
+    let mut reader = &buf[..n];  // n: usize from Option unwrap
     let resp = AuthResponse::decode(&mut reader)?;
     if !resp.ok {
         return Err(anyhow!("auth rejected: {}", resp.message));
@@ -189,7 +189,7 @@ async fn handle_local(
         .read(&mut resp_buf)
         .await?
         .ok_or_else(|| anyhow!("no response"))?;
-    let mut reader = &resp_buf[..n];
+    let mut reader = &resp_buf[..n]; // usize
     let resp = TcpConnectResponse::decode(&mut reader)?;
     if !resp.ok {
         return Err(anyhow!("remote connect failed: {}", resp.message));
@@ -232,10 +232,10 @@ async fn handle_local(
     let down = async {
         let mut buf = vec![0u8; 32 * 1024];
         loop {
-            let n = recv.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
+            let n = match recv.read(&mut buf).await? {
+                Some(n) if n > 0 => n,
+                _ => break,
+            };
             if let Some(ref mut p) = pacer_down {
                 p.write_all_paced(&mut local_w, &buf[..n]).await?;
             } else {
@@ -262,7 +262,7 @@ fn configure_client(cfg: &ClientConfigYaml) -> Result<quinn::ClientConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4096u32.into());
     transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
-    transport.datagram_send_buffer_size(Some(2 * 1024 * 1024));
+    transport.datagram_send_buffer_size(2 * 1024 * 1024);
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));

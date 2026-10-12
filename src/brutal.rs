@@ -153,7 +153,7 @@ impl BrutalPacer {
 pub async fn paced_copy<R, W>(
     mut src: R,
     mut dst: W,
-    tx_pacer: Option<&mut BrutalPacer>,
+    mut tx_pacer: Option<&mut BrutalPacer>,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,

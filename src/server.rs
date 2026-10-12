@@ -1,6 +1,6 @@
 //! Spectre server — QUIC + JLS (rustls-jls / quinn-jls).
 
-use crate::brutal::{paced_relay, BrutalConfig, BrutalPacer};
+use crate::brutal::{BrutalConfig, BrutalPacer};
 use crate::protocol::*;
 use crate::udp::{
     fragment_udp, get_or_create_session, gc_sessions, new_session_table, resolve_address,
@@ -49,7 +49,7 @@ pub async fn run_server(cfg: ServerConfigYaml) -> Result<()> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4096u32.into());
     transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
-    transport.datagram_send_buffer_size(Some(2 * 1024 * 1024));
+    transport.datagram_send_buffer_size(2 * 1024 * 1024);
 
     let quic_server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
         .context("QuicServerConfig")?;
@@ -206,7 +206,10 @@ async fn handle_proxy_stream(
     match cmd {
         Command::TcpConnect => {
             let mut rest = vec![0u8; 1024];
-            let n = recv.read(&mut rest).await?.unwrap_or(0);
+            let n = match recv.read(&mut rest).await? {
+                Some(n) => n,
+                None => 0,
+            };
             let mut buf = BytesMut::from(&rest[..n]);
             let req = TcpConnectRequest::decode(&mut buf)?;
             info!("TCP CONNECT {}", req.address.to_socket_addr_string());
@@ -216,11 +219,7 @@ async fn handle_proxy_stream(
                     let resp = TcpConnectResponse::ok();
                     send.write_all(&resp.encode()).await?;
 
-                    // Pace: client upload limited by from_client; download by to_client
-                    // Direction: recv(quic from client) -> tcp (from_client_bps)
-                    //            tcp -> send(quic to client) (to_client_bps)
-                    let (tcp_r, tcp_w) = tcp.into_split();
-                    // Recombine for paced_relay is awkward with split; do two paced copies.
+                    let (mut tcp_r, mut tcp_w) = tcp.into_split();
                     let mut pacer_up = if rates.from_client_bps > 0 {
                         Some(BrutalPacer::new(BrutalConfig::from_bps(rates.from_client_bps)))
                     } else {
@@ -234,13 +233,12 @@ async fn handle_proxy_stream(
 
                     let up = async {
                         let mut buf = vec![0u8; 32 * 1024];
-                        let mut tcp_w = tcp_w;
-                        let mut recv = recv;
                         loop {
-                            let n = recv.read(&mut buf).await?;
-                            if n == 0 {
-                                break;
-                            }
+                            // quinn RecvStream::read -> Result<Option<usize>>
+                            let n = match recv.read(&mut buf).await? {
+                                Some(n) if n > 0 => n,
+                                _ => break,
+                            };
                             if let Some(ref mut p) = pacer_up {
                                 p.write_all_paced(&mut tcp_w, &buf[..n]).await?;
                             } else {
@@ -251,9 +249,8 @@ async fn handle_proxy_stream(
                         Ok::<(), std::io::Error>(())
                     };
                     let down = async {
+                        use tokio::io::AsyncReadExt;
                         let mut buf = vec![0u8; 32 * 1024];
-                        let mut tcp_r = tcp_r;
-                        let mut send = send;
                         loop {
                             let n = tcp_r.read(&mut buf).await?;
                             if n == 0 {

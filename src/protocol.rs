@@ -409,7 +409,7 @@ pub fn random_padding(range: std::ops::Range<usize>) -> Vec<u8> {
     let mut rng = rand::thread_rng();
     let len = rng.gen_range(range);
     let mut v = vec![0u8; len];
-    rng.fill(&mut v);
+    rng.fill_bytes(&mut v);
     v
 }
 

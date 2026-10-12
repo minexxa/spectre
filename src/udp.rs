@@ -88,7 +88,7 @@ impl FragmentReassembler {
 
     /// Feed one datagram payload (already decrypted QUIC datagram body).
     /// Returns Some((session_id, address, full_payload)) when a complete packet is ready.
-    pub fn push(&mut self, mut data: Bytes) -> Result<Option<(u32, Address, Bytes)>, ProtocolError> {
+    pub fn push(&mut self, data: Bytes) -> Result<Option<(u32, Address, Bytes)>, ProtocolError> {
         self.gc();
         let mut buf = data.clone();
         let header = UdpHeader::decode(&mut buf)?;
@@ -315,7 +315,8 @@ pub async fn datagram_reassemble_loop(
 /// Resolve Address to SocketAddr (async DNS via tokio).
 pub async fn resolve_address(addr: &Address) -> Result<SocketAddr, std::io::Error> {
     let s = addr.to_socket_addr_string();
-    match tokio::net::lookup_host(&s).await?.next() {
+    let mut it = tokio::net::lookup_host(s.clone()).await?;
+    match it.next() {
         Some(a) => Ok(a),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
