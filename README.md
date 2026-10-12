@@ -27,7 +27,7 @@ MSRV: **Rust 1.80+**
 - [x] TCP proxying over QUIC bidirectional streams
 - [x] GitHub Actions release builds (Linux gnu/musl, aarch64, Windows)
 - [ ] Full `JlsServerConfig` field wiring for automatic probe → upstream TCP forward (hooks prepared)
-- [ ] Production Brutal controller plugged into quinn-jls `TransportConfig`
+- [x] Brutal congestion controller (quinn `Controller`, Hysteria2-style ack-rate compensation) plugged into `TransportConfig`
 - [ ] Complete UDP session table & fragment reassembly
 - [ ] SOCKS5 inbound on client
 
@@ -49,6 +49,23 @@ cargo run --release -- client \
   --password 'your-strong-password' \
   --username spectre \
   --listen 127.0.0.1:1080
+```
+
+`--rx` is the download rate and `--tx` the upload rate. `200mbps` means bits per
+second; a bare number means bytes per second; `0` (default) uses BBR instead of Brutal.
+Set them to your real line speed, not higher.
+
+```bash
+spectre client ... --rx 200mbps --tx 50mbps
+```
+
+### High-speed tuning
+
+Brutal cannot outrun the kernel's UDP buffers. Spectre requests 16 MiB socket
+buffers, but Linux clamps this to `rmem_max`/`wmem_max`. Raise them on **both** ends:
+
+```bash
+sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
 ```
 
 Client accepts `CONNECT host:port` (HTTP proxy style) or a bare `host:port` line.
