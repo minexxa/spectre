@@ -14,7 +14,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
@@ -92,7 +92,7 @@ async fn handle_connection(
         .read(&mut tmp)
         .await?
         .ok_or_else(|| anyhow!("auth stream closed"))?;
-    let mut buf = BytesMut::from(&tmp[..n]);
+    let buf = BytesMut::from(&tmp[..n]);
     if buf.is_empty() {
         return Err(anyhow!("empty auth"));
     }
@@ -196,8 +196,7 @@ async fn handle_proxy_stream(
     mut recv: quinn::RecvStream,
     rates: Arc<ConnectionRates>,
 ) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-    let mut header = [0u8; 1];
+        let mut header = [0u8; 1];
     if recv.read_exact(&mut header).await.is_err() {
         return Ok(());
     }
@@ -242,15 +241,13 @@ async fn handle_proxy_stream(
                             if let Some(ref mut p) = pacer_up {
                                 p.write_all_paced(&mut tcp_w, &buf[..n]).await?;
                             } else {
-                                use tokio::io::AsyncWriteExt;
-                                tcp_w.write_all(&buf[..n]).await?;
+                                                                tcp_w.write_all(&buf[..n]).await?;
                             }
                         }
                         Ok::<(), std::io::Error>(())
                     };
                     let down = async {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = vec![0u8; 32 * 1024];
+                                                let mut buf = vec![0u8; 32 * 1024];
                         loop {
                             let n = tcp_r.read(&mut buf).await?;
                             if n == 0 {
@@ -259,8 +256,7 @@ async fn handle_proxy_stream(
                             if let Some(ref mut p) = pacer_down {
                                 p.write_all_paced(&mut send, &buf[..n]).await?;
                             } else {
-                                use tokio::io::AsyncWriteExt;
-                                send.write_all(&buf[..n]).await?;
+                                                                send.write_all(&buf[..n]).await?;
                             }
                         }
                         Ok::<(), std::io::Error>(())

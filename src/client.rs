@@ -6,7 +6,6 @@ use crate::udp::{
     fragment_udp, FragmentReassembler, DEFAULT_MAX_DATAGRAM_PAYLOAD,
 };
 use anyhow::{anyhow, Context, Result};
-use bytes::{Bytes, BytesMut};
 use quinn_jls as quinn;
 use rustls_jls as rustls;
 use std::net::SocketAddr;
@@ -29,7 +28,7 @@ pub struct ClientConfigYaml {
 }
 
 pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(configure_client(&cfg)?);
 
     info!("connecting to {} (SNI={})", cfg.server, cfg.server_name);

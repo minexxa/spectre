@@ -1,7 +1,6 @@
 //! Spectre wire protocol definitions and helpers.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
+use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 
 /// Protocol version
@@ -405,7 +404,7 @@ impl UdpHeader {
 
 /// Generate random padding of length in the given range
 pub fn random_padding(range: std::ops::Range<usize>) -> Vec<u8> {
-    use rand::Rng;
+    use rand::{Rng, RngCore};
     let mut rng = rand::thread_rng();
     let len = rng.gen_range(range);
     let mut v = vec![0u8; len];

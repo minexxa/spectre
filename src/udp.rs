@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Max concurrent incomplete reassembly slots per session.
 const MAX_REASSEMBLY_SLOTS: usize = 256;
