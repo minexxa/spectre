@@ -9,6 +9,7 @@ use crate::udp::{
 use anyhow::{anyhow, Context, Result};
 use quinn_jls as quinn;
 use rustls_jls as rustls;
+use rustls::jls::JlsClientConfig;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -47,7 +48,12 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
         .await
         .context("connect failed")?;
 
-    info!("QUIC connected, Spectre AUTH");
+    if conn.is_jls() != Some(true) {
+        return Err(anyhow!(
+            "JLS authentication failed: not a Spectre server, or wrong password/username/server-name"
+        ));
+    }
+    info!("QUIC connected (JLS ok), Spectre AUTH");
     let (mut send, mut recv) = conn.open_bi().await?;
     let auth = AuthRequest {
         username: cfg.username.clone(),
@@ -376,12 +382,20 @@ async fn handle_local(
 }
 
 fn configure_client(cfg: &ClientConfigYaml) -> Result<quinn::ClientConfig> {
+    // Empty root store on purpose.
+    //   * Real Spectre server: JLS authenticates it through ServerHello.random,
+    //     and rustls-jls skips certificate/signature checks (no CA cert needed).
+    //   * Anything else (MITM, wrong server, probe target): JLS auth fails,
+    //     normal verification runs against zero trusted roots and the handshake
+    //     is rejected, so credentials are never sent to it.
+    let roots = rustls::RootCertStore::empty();
     let mut crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_root_certificates(roots)
         .with_no_client_auth();
-    crypto.alpn_protocols = vec![b"h3".to_vec(), b"spectre".to_vec()];
-    let _ = (&cfg.password, &cfg.username);
+    // user_pwd = password, user_iv = username (must match the server).
+    crypto.jls_config = JlsClientConfig::new(&cfg.password, &cfg.username);
+    // Same ALPN as a browser.
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4096u32.into());
@@ -395,44 +409,4 @@ fn configure_client(cfg: &ClientConfigYaml) -> Result<quinn::ClientConfig> {
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
-}
-
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }

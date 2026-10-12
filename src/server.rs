@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::{Bytes, BytesMut};
 use quinn_jls as quinn;
 use rustls_jls as rustls;
+use rustls::jls::JlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -44,7 +45,24 @@ pub async fn run_server(cfg: ServerConfigYaml) -> Result<()> {
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .context("failed to build tls ServerConfig")?;
-    server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"spectre".to_vec()];
+    // Look like a browser: only "h3". A custom ALPN string would be visible in
+    // the QUIC Initial packet, which anyone can decrypt.
+    server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+    // JLS: the shared secret is hidden in ClientHello.random / ServerHello.random.
+    //   * auth OK     -> normal Spectre session. The certificate above is never
+    //                    validated by the client, so a self-signed one is fine.
+    //   * auth failed -> quinn-jls forwards the raw QUIC packets to `upstream`,
+    //                    so a prober talks to the real site and sees its real
+    //                    certificate.
+    // `server_name` is also the SNI the client must send; any other SNI counts
+    // as an authentication failure and is forwarded too.
+    server_crypto.jls_config = JlsServerConfig::new(
+        password.clone(),
+        username.clone(),
+        Some(upstream.clone()),
+        Some(server_name.clone()),
+    )
+    .into();
 
     let quic_server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
         .context("QuicServerConfig")?;
@@ -111,7 +129,14 @@ async fn handle_connection(
         .await
         .context("handshake failed")?;
     let remote = conn.remote_address();
-    info!("new connection from {remote}");
+    // Failed JLS handshakes never get here (they are forwarded to the upstream
+    // site). This is a safety net in case JLS were ever disabled.
+    if conn.is_jls() != Some(true) {
+        warn!("non-JLS connection from {remote}, closing");
+        conn.close(0u32.into(), b"");
+        return Ok(());
+    }
+    info!("new connection from {remote} (JLS user={:?})", conn.jls_chosen_user());
 
     let (mut send, mut recv) = conn.accept_bi().await.context("accept auth stream")?;
     let mut tmp = [0u8; 2048];
@@ -329,11 +354,9 @@ async fn handle_udp_datagram(
 fn generate_self_signed_cert(
     server_name: &str,
 ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-    let cert = rcgen::generate_simple_self_signed(vec![
-        server_name.to_string(),
-        "localhost".into(),
-        "spectre.local".into(),
-    ])?;
+    // Never validated by JLS clients and never shown to probers (they are
+    // forwarded to the real site), so a throwaway self-signed cert is enough.
+    let cert = rcgen::generate_simple_self_signed(vec![server_name.to_string()])?;
     let cert_der = CertificateDer::from(cert.cert);
     let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
     Ok((cert_der, key_der))
