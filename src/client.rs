@@ -183,8 +183,7 @@ fn parse_local_request(buf: &[u8]) -> Result<LocalRequest> {
         "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "TRACE ",
     ];
     for m in methods {
-        if first.starts_with(m) {
-            let rest = &first[m.len()..];
+        if let Some(rest) = first.strip_prefix(m) {
             let url = rest
                 .split_whitespace()
                 .next()
