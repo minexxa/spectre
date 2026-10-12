@@ -142,37 +142,194 @@ async fn client_udp_loop(sock: UdpSocket, conn: quinn::Connection) -> Result<()>
     }
 }
 
+
+/// Parsed local inbound request.
+struct LocalRequest {
+    /// host:port to dial on the remote side
+    host: String,
+    port: u16,
+    /// true = HTTP CONNECT (reply 200 and tunnel)
+    is_connect: bool,
+    /// For absolute-form HTTP proxy: rewritten origin-form request bytes to send first
+    pending: Vec<u8>,
+}
+
+fn parse_local_request(buf: &[u8]) -> Result<LocalRequest> {
+    let text = String::from_utf8_lossy(buf);
+    let first = text
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("empty request"))?;
+
+    // CONNECT host:port HTTP/1.x
+    if let Some(rest) = first.strip_prefix("CONNECT ") {
+        let authority = rest
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow!("bad CONNECT line"))?;
+        let (host, port) = split_host_port(authority, 443)?;
+        return Ok(LocalRequest {
+            host,
+            port,
+            is_connect: true,
+            pending: Vec::new(),
+        });
+    }
+
+    // HTTP method absolute-form: GET http://host:port/path HTTP/1.1
+    let methods = [
+        "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "TRACE ",
+    ];
+    for m in methods {
+        if first.starts_with(m) {
+            let rest = &first[m.len()..];
+            let url = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| anyhow!("bad HTTP request line"))?;
+            let (host, port, path) = parse_absolute_url(url)?;
+            // Rebuild origin-form request: METHOD /path HTTP/1.x\r\n + remaining headers
+            let version = rest
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("HTTP/1.1");
+            let method = m.trim();
+            let mut out = format!("{method} {path} {version}\r\n").into_bytes();
+            // Append headers after the first line; rewrite/skip absolute Host if needed
+            if let Some(pos) = find_header_start(buf) {
+                let headers = &buf[pos..];
+                // Ensure Host header exists
+                let header_str = String::from_utf8_lossy(headers);
+                if !header_str.to_ascii_lowercase().contains("\nhost:")
+                    && !header_str.to_ascii_lowercase().starts_with("host:")
+                {
+                    out.extend_from_slice(format!("Host: {host}:{port}\r\n").as_bytes());
+                }
+                out.extend_from_slice(headers);
+            } else {
+                out.extend_from_slice(format!("Host: {host}:{port}\r\n\r\n").as_bytes());
+            }
+            return Ok(LocalRequest {
+                host,
+                port,
+                is_connect: false,
+                pending: out,
+            });
+        }
+    }
+
+    // Bare host:port
+    let (host, port) = split_host_port(first, 80)?;
+    Ok(LocalRequest {
+        host,
+        port,
+        is_connect: false,
+        pending: if buf.len() > first.len() {
+            // forward any extra bytes after the first line
+            buf[first.len()..].to_vec()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> {
+    let authority = authority.trim();
+    // [ipv6]:port
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port_part) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow!("bad ipv6 authority"))?;
+        if let Some(p) = port_part.strip_prefix(':') {
+            let port: u16 = p.parse()?;
+            return Ok((host.to_string(), port));
+        }
+        return Ok((host.to_string(), default_port));
+    }
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if !host.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            let port: u16 = port_str.parse()?;
+            return Ok((host.to_string(), port));
+        }
+    }
+    Ok((authority.to_string(), default_port))
+}
+
+fn parse_absolute_url(url: &str) -> Result<(String, u16, String)> {
+    let url = url.trim();
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else {
+        return Err(anyhow!("expected absolute http(s) URL, got {url}"));
+    };
+    let default_port: u16 = if scheme == "https" { 443 } else { 80 };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return Err(anyhow!("missing host in URL"));
+    }
+    let (host, port) = split_host_port(authority, default_port)?;
+    Ok((host, port, path.to_string()))
+}
+
+fn find_header_start(buf: &[u8]) -> Option<usize> {
+    // after first \n
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == b'\n' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+
 async fn handle_local(
     mut local: TcpStream,
     peer: SocketAddr,
     conn: quinn::Connection,
     rates: Arc<(u64, u64)>,
 ) -> Result<()> {
-    let mut header = vec![0u8; 256];
-    let n = local.read(&mut header).await?;
-    let header_str = String::from_utf8_lossy(&header[..n]);
-    let target = if let Some(line) = header_str.lines().next() {
-        if let Some(rest) = line.strip_prefix("CONNECT ") {
-            rest.split_whitespace().next().unwrap_or("").to_string()
-        } else {
-            line.trim().to_string()
+    // Read enough for HTTP headers (up to 8 KiB or until blank line)
+    let mut header = vec![0u8; 8192];
+    let mut filled = 0usize;
+    loop {
+        let n = local.read(&mut header[filled..]).await?;
+        if n == 0 {
+            break;
         }
-    } else {
-        return Err(anyhow!("empty request from {peer}"));
-    };
-    if target.is_empty() {
-        return Err(anyhow!("no target"));
+        filled += n;
+        let view = &header[..filled];
+        let is_http = view.starts_with(b"GET ")
+            || view.starts_with(b"POST ")
+            || view.starts_with(b"HEAD ")
+            || view.starts_with(b"PUT ")
+            || view.starts_with(b"DELETE ")
+            || view.starts_with(b"OPTIONS ")
+            || view.starts_with(b"PATCH ")
+            || view.starts_with(b"CONNECT ");
+        if !is_http {
+            break;
+        }
+        if view.windows(4).any(|w| w == b"\r\n\r\n") || filled >= header.len() {
+            break;
+        }
     }
+    let req_local = parse_local_request(&header[..filled])?;
+    info!(
+        "proxying {peer} -> {}:{} (connect={})",
+        req_local.host, req_local.port, req_local.is_connect
+    );
 
-    info!("proxying {peer} -> {target}");
     let (mut send, mut recv) = conn.open_bi().await?;
-
-    let (host, port_str) = target
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("invalid target {target}"))?;
-    let port: u16 = port_str.parse()?;
-    let addr = Address::new(host, port);
-
+    let addr = Address::new(req_local.host.clone(), req_local.port);
     let req = TcpConnectRequest {
         address: addr,
         padding: random_padding(8..32),
@@ -184,16 +341,19 @@ async fn handle_local(
         .read(&mut resp_buf)
         .await?
         .ok_or_else(|| anyhow!("no response"))?;
-    let mut reader = &resp_buf[..n]; // usize
+    let mut reader = &resp_buf[..n];
     let resp = TcpConnectResponse::decode(&mut reader)?;
     if !resp.ok {
         return Err(anyhow!("remote connect failed: {}", resp.message));
     }
 
-    if header_str.starts_with("CONNECT ") {
+    if req_local.is_connect {
         local
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
+    } else if !req_local.pending.is_empty() {
+        // Absolute-form HTTP: send rewritten origin-form request into the tunnel
+        send.write_all(&req_local.pending).await?;
     }
 
     let (tx_bps, rx_bps) = *rates;
