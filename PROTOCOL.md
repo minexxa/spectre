@@ -13,10 +13,16 @@
 ## Layers
 
 ```
-Application Proxy (TCP streams / UDP sessions)
-Spectre Framing Layer (commands, addresses, padding)
-QUIC (streams + datagrams) + JLS / TLS 1.3 (camouflage)
-UDP
+┌─────────────────────────────────────┐
+│          Application Proxy          │  (TCP streams / UDP sessions)
+├─────────────────────────────────────┤
+│       Spectre Framing Layer         │  (commands, addresses, padding)
+├─────────────────────────────────────┤
+│   QUIC (streams + datagrams)        │
+│   + JLS / TLS 1.3 (camouflage)      │
+├─────────────────────────────────────┤
+│              UDP                    │
+└─────────────────────────────────────┘
 ```
 
 ## Authentication & Camouflage (JLS-style)
@@ -24,13 +30,13 @@ UDP
 1. Client and server share a pre-shared secret (password / username:password).
 2. Authentication material is embedded inside the TLS ClientHello / ServerHello (via JLS).
 3. If authentication succeeds → the QUIC connection becomes a Spectre proxy session.
-4. If authentication fails (or is absent) → the server transparently forwards the flow to a configured upstream camouflage target. Active probers only see a normal website response.
+4. If authentication fails (or is absent) → the server transparently forwards the TCP/UDP flow to a configured **upstream camouflage target** (e.g. a real website). Active probers only see a normal website response.
 
-Current implementation uses a simplified control-stream auth + self-signed/ephemeral certs as a stepping stone. Full rustls-jls / quinn-jls integration is planned.
+> Current implementation uses a simplified control-stream auth + self-signed/ephemeral certs as a stepping stone. Full rustls-jls / quinn-jls integration is planned.
 
 ## Framing (after successful auth)
 
-All multi-byte integers are big-endian.
+All multi-byte integers are **big-endian**. Variable-length integers follow QUIC varint encoding where noted.
 
 ### Command Types (first byte on a bidirectional stream)
 
@@ -45,42 +51,73 @@ All multi-byte integers are big-endian.
 
 ```
 [u8]     cmd = 0x01
-[u16]    address_len
-[bytes]  address   (UTF-8 "host:port")
-[u16]    padding_len
+[varint] address_len
+[bytes]  address   (UTF-8 "host:port" or binary SOCKS-like)
+[varint] padding_len
 [bytes]  random_padding
 ```
 
-Server responds:
+Server responds on the same stream:
 
 ```
 [u8]     status   (0x00 = OK, 0x01 = error)
-[u16]    msg_len
-[bytes]  message
-[u16]    padding_len
+[varint] msg_len
+[bytes]  message  (optional error string)
+[varint] padding_len
 [bytes]  random_padding
 ```
 
-After status == OK, the stream becomes a pure bidirectional byte pipe.
+After status == OK, the stream becomes a pure bidirectional byte pipe to the remote TCP endpoint.
 
 ### UDP
 
-UDP packets travel over QUIC unreliable datagrams.
+UDP packets travel over **QUIC unreliable datagrams**.
+
+Each datagram payload:
 
 ```
 [u32]    session_id
 [u16]    packet_id
 [u8]     fragment_id
-[u8]     fragment_count
-[u16]    address_len
+[u8]     fragment_count   (1 = not fragmented)
+[varint] address_len
 [bytes]  address
 [bytes]  payload
 ```
 
+- `session_id` is chosen by the client and unique per UDP association.
+- Large packets are fragmented; receiver reassembles by `(session_id, packet_id)`.
+- Missing fragments → drop the whole packet.
+
+A control bidirectional stream (cmd = 0x02) may be used to negotiate session lifetime / close, but is optional for the first version.
+
 ## Congestion Control — Brutal Mode
 
-Client declares tx_bps / rx_bps during auth. Non-zero target rate → sender ignores classic loss-based backoff and maintains the rate (compensating loss by retransmission). Rate 0 → fall back to BBR/Cubic.
+During (or right after) authentication the client may declare:
+
+- `tx_bps` — desired upload rate (bytes/sec)
+- `rx_bps` — desired download rate (bytes/sec)
+
+Semantics (inspired by Hysteria Brutal):
+
+- When a non-zero target rate is set, the sender **ignores classic loss-based backoff** and tries to maintain the target rate, compensating loss by retransmission.
+- Rate 0 → fall back to standard BBR / Cubic.
+- Server may also return its preferred rates.
+
+Implementation note: custom `quinn::congestion::Controller` that implements a token-bucket / pacing at the target rate.
+
+## Padding & Obfuscation
+
+- Random padding of variable length is mandatory on control messages.
+- Optional packet-level obfuscation (XOR with keyed stream) can be added later (Salamander-style).
+
+## Security Considerations
+
+- Password must be high-entropy.
+- Replay protection is provided by the underlying QUIC / TLS handshake.
+- 0-RTT is disabled by default until careful anti-replay is designed.
+- Active probing resistance relies on correct upstream fallback behaviour.
 
 ## Version
 
-Spectre wire format version 0x01.
+This document describes Spectre wire format version 0x01.
