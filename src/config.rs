@@ -67,13 +67,20 @@ pub enum Mode {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DnsConfig {
-    /// Local DNS UDP listen port. Omit / 0 = DNS module disabled.
+    /// Local DNS UDP listen port. Omit / 0 = do not listen
+    /// (DNS module can still run for route-hijack only).
     #[serde(default)]
     pub port: Option<u16>,
 
     /// When true (default), DNS upstream follows route decision.
     #[serde(default = "default_true", rename = "rule-follow-route")]
     pub rule_follow_route: bool,
+
+    /// Hijack DNS queries seen on tproxy/mixed (port 53 or sniffed DNS)
+    /// into the local DNS module. Requires DNS module enabled
+    /// (port set and/or nameservers configured).
+    #[serde(default, rename = "route-hijack", alias = "hijack-dns")]
+    pub route_hijack: bool,
 
     #[serde(default, rename = "direct-nameserver")]
     pub direct_nameserver: Option<String>,
@@ -124,6 +131,9 @@ impl Config {
                 }
                 if self.mixed_port.is_none() && self.tproxy_port.unwrap_or(0) == 0 {
                     bail!("client mode requires at least one of `mixed-port` / `tproxy-port`");
+                }
+                if self.dns.route_hijack && !self.dns_enabled() {
+                    bail!("dns.route-hijack requires DNS module enabled (set dns.port and/or nameservers)");
                 }
                 // Resolve relative ARS paths against config file directory.
                 let base = config_path
@@ -191,9 +201,16 @@ impl Config {
         }
     }
 
-    /// Whether the DNS module should run.
+    /// Whether the DNS module should run (listen and/or route-hijack).
     pub fn dns_enabled(&self) -> bool {
-        matches!(self.dns.port, Some(p) if p > 0)
+        let has_port = matches!(self.dns.port, Some(p) if p > 0);
+        let has_ns = self.dns.direct_nameserver.is_some() || self.dns.proxy_nameserver.is_some();
+        has_port || (self.dns.route_hijack && has_ns)
+    }
+
+    /// DNS route-hijack active (tproxy/mixed steals DNS into local module).
+    pub fn dns_route_hijack(&self) -> bool {
+        self.dns.route_hijack && self.dns_enabled()
     }
 }
 

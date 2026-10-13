@@ -418,7 +418,11 @@ pub async fn run_client_from_config(cfg: crate::config::Config) -> Result<()> {
     use std::sync::Arc;
 
     let entries = parse_routes(&cfg.route)?;
-    let router = Arc::new(build_router(entries, cfg.sniff)?);
+    let hijack = cfg.dns_route_hijack();
+    let router = Arc::new(build_router(entries, cfg.sniff, hijack)?);
+    if cfg.dns_enabled() {
+        crate::dns::init_engine(&cfg)?;
+    }
 
     let mut handles = Vec::new();
 
