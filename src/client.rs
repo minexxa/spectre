@@ -624,16 +624,11 @@ async fn ensure_udp_reader(conn: quinn::Connection) {
     }
     tokio::spawn(async move {
         let mut reasm = FragmentReassembler::new();
-        loop {
-            match conn.read_datagram().await {
-                Ok(data) => {
-                    if let Ok(Some((sid, addr, payload))) = reasm.push(data) {
-                        if let Some(tx) = udp_replies().get(&sid) {
-                            let _ = tx.send((addr, payload));
-                        }
-                    }
+        while let Ok(data) = conn.read_datagram().await {
+            if let Ok(Some((sid, addr, payload))) = reasm.push(data) {
+                if let Some(tx) = udp_replies().get(&sid) {
+                    let _ = tx.send((addr, payload));
                 }
-                Err(_) => break,
             }
         }
     });
