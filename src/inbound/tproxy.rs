@@ -350,17 +350,14 @@ async fn handle_tproxy_udp_pkt(
             let sock = UdpSocket::bind(bind).await?;
             sock.send_to(data, dst).await?;
             let mut rbuf = vec![0u8; 65535];
-            match tokio::time::timeout(
+            if let Ok(Ok((n, _from))) = tokio::time::timeout(
                 Duration::from_secs(5),
                 sock.recv_from(&mut rbuf),
             )
             .await
             {
-                Ok(Ok((n, _from))) => {
-                    // Reply to original client with original dst as source
-                    sendto_with_src(&raw, &rbuf[..n], src, dst)?;
-                }
-                _ => {}
+                // Reply to original client with original dst as source
+                sendto_with_src(&raw, &rbuf[..n], src, dst)?;
             }
         }
         Outbound::Proxy => {
@@ -374,13 +371,10 @@ async fn handle_tproxy_udp_pkt(
             crate::client::spectre_udp_send(&cfg, sid, &addr, data).await?;
             // collect a few replies
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some((_src_addr, payload))) => {
-                        let _ = sendto_with_src(&raw, &payload, src, dst);
-                    }
-                    _ => break,
-                }
+            while let Ok(Some((_src_addr, payload))) =
+                tokio::time::timeout_at(deadline, rx.recv()).await
+            {
+                let _ = sendto_with_src(&raw, &payload, src, dst);
             }
             crate::client::spectre_udp_close_session(sid);
         }
