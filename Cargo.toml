@@ -41,6 +41,10 @@ fst = "0.4"
 regex = "1"
 ring = "0.17"
 
+# DoT / DoH upstream (standard rustls, independent of rustls-jls)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "0.26"
+
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 etherparse = "0.15"

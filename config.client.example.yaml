@@ -22,8 +22,16 @@ dns:
   mode: fakeip                 # redir-host | fakeip
   route-hijack: true
   rule-follow-route: true
+  # Schemes: udp (default) | tcp | tls (DoT) | https (DoH)
+  #   223.5.5.5
+  #   udp://1.1.1.1:53
+  #   tcp://1.1.1.1:53
+  #   tls://1.1.1.1:853
+  #   tls://dns.google
+  #   https://1.1.1.1/dns-query
+  #   https://cloudflare-dns.com/dns-query
   direct-nameserver: 223.5.5.5
-  proxy-nameserver: 1.1.1.1
+  proxy-nameserver: tls://1.1.1.1:853
   cache-size: 4096
   fakeip-range: 198.18.0.0/16
   # fakeip6-range: fc00::/18
