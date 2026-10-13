@@ -81,7 +81,8 @@ async fn handle_tcp(
     router: Arc<Router>,
     cfg: Arc<Config>,
 ) -> Result<()> {
-    let mut peek = [0u8; 512];
+    // One-byte peek to distinguish SOCKS vs HTTP (same as ant).
+    let mut peek = [0u8; 1];
     let n = stream.peek(&mut peek).await?;
     if n == 0 {
         return Ok(());
@@ -89,52 +90,169 @@ async fn handle_tcp(
     if peek[0] == 0x05 || peek[0] == 0x04 {
         handle_socks(&mut stream, peer, router, cfg).await
     } else {
-        handle_http_or_raw(&mut stream, &peek[..n], router, cfg).await
+        handle_http(&mut stream, peer, router, cfg).await
     }
 }
 
-async fn handle_http_or_raw(
+async fn handle_http(
     stream: &mut TcpStream,
-    peeked: &[u8],
+    _peer: SocketAddr,
     router: Arc<Router>,
     cfg: Arc<Config>,
 ) -> Result<()> {
-    let mut buf = peeked.to_vec();
-    if !buf.windows(4).any(|w| w == b"\r\n\r\n") && !buf.contains(&b'\n') {
-        let mut tmp = [0u8; 2048];
+    // Consume full request headers (must read, not only peek — otherwise CONNECT
+    // request bytes stay in the socket and leak into the TLS tunnel).
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+    loop {
         let n = stream.read(&mut tmp).await?;
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let first_line = text.lines().next().unwrap_or("").trim().to_string();
-    let target = if first_line.to_uppercase().starts_with("CONNECT ") {
-        let rest = &first_line[8..];
-        let hostport = rest.split_whitespace().next().unwrap_or("");
-        parse_host_port(hostport)?
-    } else if let Some((host, port)) = parse_bare_host_port(&first_line) {
-        Target::from_host_port(&host, port)
-    } else {
-        bail!("unsupported request: {first_line}");
-    };
-    if first_line.to_uppercase().starts_with("CONNECT ") {
-        if !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            let mut tmp = [0u8; 2048];
-            loop {
-                let n = stream.read(&mut tmp).await?;
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
+        if n == 0 {
+            return Ok(());
         }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 64 * 1024 {
+            bail!("http header too large");
+        }
+    }
+
+    let header = String::from_utf8_lossy(&buf);
+    let first_line = header.lines().next().unwrap_or("").trim();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        let tgt = parse_host_port(target)?;
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
+        dispatch_tcp(stream, tgt, router, cfg).await
+    } else if let Some((host, port)) = parse_bare_host_port(first_line) {
+        // legacy bare host:port line
+        dispatch_tcp(stream, Target::from_host_port(&host, port), router, cfg).await
+    } else if method.eq_ignore_ascii_case("GET")
+        || method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("HEAD")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("DELETE")
+        || method.eq_ignore_ascii_case("OPTIONS")
+        || method.eq_ignore_ascii_case("PATCH")
+    {
+        // Absolute-form HTTP proxy: rewrite to origin-form and forward via tunnel.
+        let host = header
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("Host:")
+                    .or_else(|| l.strip_prefix("host:"))
+                    .map(|s| s.trim().to_string())
+            })
+            .or_else(|| {
+                target
+                    .strip_prefix("http://")
+                    .and_then(|r| r.split('/').next())
+                    .map(|s| s.to_string())
+            })
+            .context("http proxy: no Host")?;
+        let (h, port) = if let Some((a, b)) = host.rsplit_once(':') {
+            (a.to_string(), b.parse().unwrap_or(80))
+        } else {
+            (host.clone(), 80)
+        };
+        let path = if let Some(rest) = target.strip_prefix("http://") {
+            rest.find('/')
+                .map(|i| rest[i..].to_string())
+                .unwrap_or_else(|| "/".into())
+        } else {
+            target.to_string()
+        };
+        let mut new_req = format!("{method} {path} HTTP/1.1\r\n");
+        for line in header.lines().skip(1) {
+            if line.is_empty() {
+                break;
+            }
+            if line.to_ascii_lowercase().starts_with("proxy-connection") {
+                continue;
+            }
+            new_req.push_str(line);
+            new_req.push_str("\r\n");
+        }
+        new_req.push_str("\r\n");
+        let body = if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            buf[pos + 4..].to_vec()
+        } else {
+            Vec::new()
+        };
+        // Dial via router then write rewritten request
+        let target = Target::from_host_port(&h, port);
+        // Prepend rewritten request into the outbound stream by a small wrapper:
+        // open outbound, write new_req+body, then relay remaining.
+        http_absolute_proxy(stream, target, router, cfg, new_req.into_bytes(), body).await
+    } else {
+        bail!("unsupported request: {first_line}");
     }
-    dispatch_tcp(stream, target, router, cfg).await
+}
+
+async fn http_absolute_proxy(
+    local: &mut TcpStream,
+    target: Target,
+    router: Arc<Router>,
+    cfg: Arc<Config>,
+    head: Vec<u8>,
+    body: Vec<u8>,
+) -> Result<()> {
+    let mut head_buf = [0u8; 1024];
+    let n = local.peek(&mut head_buf).await.unwrap_or(0);
+    let sniff = if n > 0 && router.sniff_enabled() {
+        sniffer::sniff_tcp_ex(&head_buf[..n], true, false)
+    } else {
+        sniffer::SniffResult::default()
+    };
+    let domain = sniff.domain.clone().or_else(|| match &target {
+        Target::Domain { host, .. } => Some(host.clone()),
+        Target::Addr(_) => None,
+    });
+    let decision = if let Some(ref d) = domain {
+        router.match_domain(d)
+    } else if let Target::Addr(a) = &target {
+        router.match_ip(a.ip())
+    } else {
+        router.match_domain("")
+    };
+    debug!(
+        "mixed http {} -> {:?} via {}",
+        target.display(),
+        decision.outbound,
+        decision.rule
+    );
+    match decision.outbound {
+        Outbound::Direct => {
+            let mut remote = match &target {
+                Target::Addr(a) => TcpStream::connect(a).await?,
+                Target::Domain { host, port } => {
+                    TcpStream::connect((host.as_str(), *port)).await?
+                }
+            };
+            remote.write_all(&head).await?;
+            if !body.is_empty() {
+                remote.write_all(&body).await?;
+            }
+            let (mut lr, mut lw) = tokio::io::split(local);
+            let (mut rr, mut rw) = remote.into_split();
+            tokio::select! {
+                r = tokio::io::copy(&mut lr, &mut rw) => { let _ = r; }
+                r = tokio::io::copy(&mut rr, &mut lw) => { let _ = r; }
+            }
+        }
+        Outbound::Proxy => {
+            // Use a buffer stream: write head+body after spectre connect via a helper
+            crate::client::proxy_via_spectre_with_preface(local, &target, &cfg, &head, &body)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn handle_socks(
