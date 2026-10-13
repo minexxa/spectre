@@ -1,26 +1,49 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use spectre::config::{Config, Mode};
+use spectre::client::ruleset::{convert_to_ars, ProviderBehavior};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "spectre", about = "Spectre QUIC proxy with JLS camouflage")]
 struct Cli {
-    /// Path to YAML config file
-    #[arg(short = 'c', long = "config", value_name = "FILE", conflicts_with = "dir")]
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Path to YAML config file (proxy mode)
+    #[arg(short = 'c', long = "config", value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
-    /// Directory containing config.yaml (or any *.yaml / *.yml)
-    #[arg(short = 'd', long = "dir", value_name = "DIR", conflicts_with = "config")]
+    /// Directory containing config.yaml (or any *.yaml / *.yml) (proxy mode)
+    #[arg(short = 'd', long = "dir", value_name = "DIR", global = true)]
     dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Convert mihomo YAML / text / sing-box JSON ruleset → binary `.ars`
+    #[command(name = "convert-ruleset", visible_alias = "ruleset-convert")]
+    ConvertRuleset {
+        /// Input: `.yaml`/`.yml` (mihomo payload or classical text) or `.json` (sing-box)
+        #[arg(short = 'i', long = "input", value_name = "FILE")]
+        input: PathBuf,
+
+        /// Output `.ars` path
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        output: PathBuf,
+
+        /// Force behavior for mihomo sources: domain | ipcidr | classical
+        /// (default: auto-detect from content / YAML `behavior:`)
+        #[arg(long = "behavior", value_name = "BEHAVIOR")]
+        behavior: Option<String>,
+    },
 }
 
 fn find_config_in_dir(dir: &Path) -> Result<PathBuf> {
     if !dir.is_dir() {
         bail!("not a directory: {}", dir.display());
     }
-    // Prefer well-known names, then any *.yaml / *.yml (sorted).
     const PREFERRED: &[&str] = &[
         "config.yaml",
         "config.yml",
@@ -56,11 +79,13 @@ fn find_config_in_dir(dir: &Path) -> Result<PathBuf> {
 }
 
 fn resolve_config_path(cli: &Cli) -> Result<PathBuf> {
+    if cli.config.is_some() && cli.dir.is_some() {
+        bail!("-c/--config and -d/--dir are mutually exclusive");
+    }
     match (&cli.config, &cli.dir) {
         (Some(c), None) => Ok(c.clone()),
         (None, Some(d)) => find_config_in_dir(d),
         (None, None) => {
-            // Default: ./config.yaml if present, else require explicit -c/-d
             let p = PathBuf::from("config.yaml");
             if p.is_file() {
                 Ok(p)
@@ -68,23 +93,23 @@ fn resolve_config_path(cli: &Cli) -> Result<PathBuf> {
                 bail!("specify -c <file> or -d <dir> (or place config.yaml in cwd)");
             }
         }
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+        (Some(_), Some(_)) => unreachable!(),
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let config_path = resolve_config_path(&cli)?;
-    let cfg = Config::load(&config_path)?;
-
-    let level = cfg.log_level.as_deref().unwrap_or("info");
+fn init_tracing(level: &str) {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(format!("spectre={level}"))),
         )
         .init();
+}
+
+async fn run_proxy(config_path: &Path) -> Result<()> {
+    let cfg = Config::load(config_path)?;
+    let level = cfg.log_level.as_deref().unwrap_or("info");
+    init_tracing(level);
 
     match cfg.mode {
         Mode::Server => {
@@ -102,4 +127,29 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::ConvertRuleset {
+            input,
+            output,
+            behavior,
+        }) => {
+            init_tracing("info");
+            let beh = behavior
+                .as_deref()
+                .map(ProviderBehavior::parse)
+                .transpose()?;
+            convert_to_ars(&input, &output, beh)?;
+            Ok(())
+        }
+        None => {
+            let path = resolve_config_path(&cli)?;
+            run_proxy(&path).await
+        }
+    }
 }
