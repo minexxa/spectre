@@ -2,20 +2,24 @@ mode: client
 bind-address: 127.0.0.1
 log-level: info
 
-server: 1.2.3.4:4433
-server-name: www.cloudflare.com
-username: spectre
-password: your-strong-password
-rx: 200mbps
-tx: 50mbps
-
 mixed-port: 1080
 # tproxy-port: 12345   # Linux/Android only
 
 sniff: true
 
+# Spectre node (same level as route)
+proxy:
+  server: 1.2.3.4
+  port: 4433
+  sni: www.cloudflare.com
+  user: spectre
+  password: your-strong-password
+  rx: 200mbps
+  tx: 50mbps
+
 dns:
   port: 5353
+  route-hijack: true
   rule-follow-route: true
   direct-nameserver: 223.5.5.5
   proxy-nameserver: 1.1.1.1

@@ -6,6 +6,6 @@ log-level: info
 proxy:
   port: 4433
   password: your-strong-password
-  username: spectre
-  server-name: www.cloudflare.com
+  user: spectre
+  sni: www.cloudflare.com
   upstream: www.cloudflare.com:443
