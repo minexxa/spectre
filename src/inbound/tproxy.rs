@@ -24,7 +24,7 @@ pub async fn run_tproxy(cfg: Arc<Config>, router: Arc<Router>) -> Result<()> {
     if port == 0 {
         return Ok(());
     }
-    let addrs = sockopt::listen_addrs(&cfg.bind_address, port);
+    let addrs = sockopt::listen_addrs(cfg.bind_address_str(), port);
     let mut handles = Vec::new();
 
     for addr in addrs {
