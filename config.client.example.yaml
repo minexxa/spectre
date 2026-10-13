@@ -32,7 +32,8 @@ dns:
   direct-nameserver: 223.5.5.5
   proxy-nameserver: tls://1.1.1.1:853
   cache-size: 4096
-  fakeip-range: 198.18.0.0/16
+  # fakeip-range / fakeip6-range default to 198.18.0.0/15 and fc00::/18
+  # fakeip-range: 198.18.0.0/15
   # fakeip6-range: fc00::/18
   fakeip-filter-mode: blacklist  # blacklist | whitelist
   # fakeip-filter:
