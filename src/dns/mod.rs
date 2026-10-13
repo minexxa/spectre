@@ -1,9 +1,11 @@
 //! Minimal local DNS: UDP listen + rule-follow-route + cache + route-hijack.
 
 mod cache;
+mod fakeip;
 mod upstream;
 
 pub use cache::DnsCache;
+pub use fakeip::FakeIpPool;
 pub use upstream::{exchange, parse_nameserver, DnsUpstream};
 
 use crate::app::router::{Outbound, Router};
@@ -88,6 +90,44 @@ async fn answer_with(eng: &DnsEngine, query: &[u8], router: &Router) -> Result<V
             }
             debug!("dns cache hit {domain}");
             return Ok(hit);
+        }
+    }
+
+    // Fake-IP for A (1) / AAAA (28)
+    if router.fakeip_enabled() && !domain.is_empty() && router.use_fakeip(&domain) {
+        if qtype == 1 {
+            if router.has_fakeip_v4() {
+                if let Some(ip) = router.allocate_fakeip(&domain, false) {
+                    let resp = fakeip::build_fakeip_answer(query, ip);
+                    if let Some(cache) = &eng.cache {
+                        cache.put(
+                            &domain,
+                            qtype,
+                            resp.clone(),
+                            Duration::from_secs(1),
+                        );
+                    }
+                    return Ok(resp);
+                }
+            }
+            return Ok(make_noerror_empty(query));
+        }
+        if qtype == 28 {
+            if router.has_fakeip_v6() {
+                if let Some(ip) = router.allocate_fakeip(&domain, true) {
+                    let resp = fakeip::build_fakeip_answer(query, ip);
+                    if let Some(cache) = &eng.cache {
+                        cache.put(
+                            &domain,
+                            qtype,
+                            resp.clone(),
+                            Duration::from_secs(1),
+                        );
+                    }
+                    return Ok(resp);
+                }
+            }
+            return Ok(make_noerror_empty(query));
         }
     }
 
