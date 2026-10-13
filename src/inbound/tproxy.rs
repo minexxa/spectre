@@ -357,10 +357,8 @@ async fn hijack_dns_udp(
 async fn udp_direct_session(
     raw: Arc<RawSockets>,
     peer: SocketAddr,
-    /// Original destination (for source-spoofed replies).
-    dest: SocketAddr,
-    /// Real dial address (after fake-ip reverse resolve).
-    real: SocketAddr,
+    dest: SocketAddr, // original dest for source-spoofed replies
+    real: SocketAddr, // real dial addr after fake-ip reverse resolve
     first: Vec<u8>,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
