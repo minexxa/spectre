@@ -1,0 +1,7 @@
+mode: server
+listen: 0.0.0.0:4433
+password: your-strong-password
+username: spectre
+server-name: www.cloudflare.com
+upstream: www.cloudflare.com:443
+log-level: info
