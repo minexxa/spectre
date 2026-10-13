@@ -27,13 +27,7 @@ pub fn parse_nameserver(s: &str) -> Result<DnsUpstream> {
         return Ok(DnsUpstream { addr });
     }
     // Bare IP or hostname → port 53
-    let with_port = if addr_str.starts_with('[') {
-        format!("{addr_str}:53")
-    } else if addr_str.parse::<std::net::IpAddr>().is_ok() {
-        format!("{addr_str}:53")
-    } else {
-        format!("{addr_str}:53")
-    };
+    let with_port = format!("{addr_str}:53");
     let addr = with_port
         .to_socket_addrs()
         .context("resolve nameserver")?

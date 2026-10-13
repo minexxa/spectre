@@ -2,8 +2,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+type CacheKey = (String, u16);
+type CacheVal = (Vec<u8>, Instant);
+type CacheMap = HashMap<CacheKey, CacheVal>;
+
 pub struct DnsCache {
-    inner: Mutex<HashMap<(String, u16), (Vec<u8>, Instant)>>,
+    inner: Mutex<CacheMap>,
     capacity: usize,
 }
 

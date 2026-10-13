@@ -214,7 +214,7 @@ fn make_noerror_empty(query: &[u8]) -> Vec<u8> {
     }
     // QR=1, RCODE=0
     resp[2] = (resp[2] & 0x01) | 0x80; // QR
-    resp[3] = resp[3] & 0xf0; // RCODE=0
+    resp[3] &= 0xf0; // RCODE=0
     // ANCOUNT/NSCOUNT/ARCOUNT = 0
     resp[6] = 0;
     resp[7] = 0;
@@ -287,5 +287,5 @@ fn response_ttl_secs(resp: &[u8]) -> Option<u32> {
     // skip TYPE CLASS
     i += 4;
     let ttl = u32::from_be_bytes([resp[i], resp[i + 1], resp[i + 2], resp[i + 3]]);
-    Some(ttl.max(60).min(86400))
+    Some(ttl.clamp(60, 86400))
 }
