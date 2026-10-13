@@ -21,17 +21,32 @@ pub struct RouteMatch {
 pub struct Router {
     rules: Vec<(RouteEntry, Option<Arc<RuleSet>>)>,
     sniff: bool,
+    /// When true, tproxy/mixed should feed DNS queries into the local DNS module.
+    hijack_dns: bool,
 }
 
 impl Router {
-    pub fn new(entries: Vec<RouteEntry>, rulesets: Vec<Option<Arc<RuleSet>>>, sniff: bool) -> Self {
+    pub fn new(
+        entries: Vec<RouteEntry>,
+        rulesets: Vec<Option<Arc<RuleSet>>>,
+        sniff: bool,
+        hijack_dns: bool,
+    ) -> Self {
         assert_eq!(entries.len(), rulesets.len());
         let rules = entries.into_iter().zip(rulesets).collect();
-        Self { rules, sniff }
+        Self {
+            rules,
+            sniff,
+            hijack_dns,
+        }
     }
 
     pub fn sniff_enabled(&self) -> bool {
         self.sniff
+    }
+
+    pub fn hijack_dns(&self) -> bool {
+        self.hijack_dns
     }
 
     pub fn match_domain(&self, domain: &str) -> RouteMatch {
@@ -101,21 +116,25 @@ fn outbound_to(k: &OutboundKind) -> Outbound {
     }
 }
 
-pub fn build_router(
-    entries: Vec<RouteEntry>,
-    sniff: bool,
-) -> Result<Router> {
+pub fn build_router(entries: Vec<RouteEntry>, sniff: bool, hijack_dns: bool) -> Result<Router> {
     let mut rulesets = Vec::with_capacity(entries.len());
     for e in &entries {
         match e {
             RouteEntry::RuleSet { path, .. } => {
-                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("ars");
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ars");
                 let rs = crate::ruleset::load_file(name, path)?;
-                tracing::info!("loaded ruleset {} ({} rules)", path.display(), rs.rule_count);
+                tracing::info!(
+                    "loaded ruleset {} ({} rules)",
+                    path.display(),
+                    rs.rule_count
+                );
                 rulesets.push(Some(Arc::new(rs)));
             }
             RouteEntry::Match(_) => rulesets.push(None),
         }
     }
-    Ok(Router::new(entries, rulesets, sniff))
+    Ok(Router::new(entries, rulesets, sniff, hijack_dns))
 }
