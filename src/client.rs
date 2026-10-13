@@ -473,7 +473,8 @@ pub async fn run_client_from_config(cfg: crate::config::Config) -> Result<()> {
 
     // Wait for any task to finish (normally they run forever)
     let (result, _idx, _rest) = futures::future::select_all(handles).await;
-    result.map_err(|e| anyhow!("inbound task join error: {e}"))?
+    result.map_err(|e| anyhow!("inbound task join error: {e}"))?;
+    Ok(())
 }
 
 use crate::inbound::target::Target;
