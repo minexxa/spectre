@@ -90,10 +90,6 @@ pub struct DnsConfig {
     #[serde(default = "default_dns_mode")]
     pub mode: String,
 
-    /// When true (default), DNS upstream follows route decision.
-    #[serde(default = "default_true", rename = "rule-follow-route")]
-    pub rule_follow_route: bool,
-
     /// Hijack DNS queries seen on tproxy/mixed (port 53 or sniffed DNS)
     /// into the local DNS module. Requires DNS module enabled
     /// (port set and/or nameservers configured).
