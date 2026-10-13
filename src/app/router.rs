@@ -2,7 +2,7 @@
 //! Fake-IP pool + reverse mapping (aligned with ant).
 
 use crate::config::{OutboundKind, RouteEntry};
-use crate::dns::fakeip::FakeIpPool;
+use crate::dns::FakeIpPool;
 use crate::ruleset::RuleSet;
 use anyhow::Result;
 use std::net::IpAddr;
