@@ -223,8 +223,7 @@ fn make_noerror_empty(query: &[u8]) -> Vec<u8> {
     resp[10] = 0;
     resp[11] = 0;
     // keep question section only
-    if let Ok((domain, _)) = parse_question(query) {
-        let qname_len = domain.len() + 2; // labels + zeros roughly; safer: find end
+    if parse_question(query).is_ok() {
         let end = question_end(query).unwrap_or(query.len().min(512));
         resp.truncate(end);
     }
