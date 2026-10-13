@@ -1,8 +1,6 @@
 //! Spectre client: inbounds, routing, DNS, ruleset, QUIC outbound.
 
-pub mod router;
-pub mod sniffer;
-pub mod sockopt;
+pub mod app;
 pub mod inbound;
 pub mod dns;
 pub mod ruleset;
@@ -420,7 +418,7 @@ fn configure_client(cfg: &ClientConfigYaml) -> Result<quinn::ClientConfig> {
 
 /// New entry point driven by YAML config.
 pub async fn run_client_from_config(cfg: crate::config::Config) -> Result<()> {
-    use crate::client::router::build_router;
+    use crate::client::app::router::build_router;
     use crate::config::parse_routes;
     use std::sync::Arc;
 
