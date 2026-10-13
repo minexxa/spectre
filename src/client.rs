@@ -4,7 +4,7 @@ use crate::brutal::{bind_udp, tune_transport, BrutalHandle};
 use crate::relay::relay;
 use crate::protocol::*;
 use crate::udp::{
-    fragment_udp, FragmentReassembler, DEFAULT_MAX_DATAGRAM_PAYLOAD,
+    fragment_udp, FragmentReassembler, send_udp_over_quic, DEFAULT_MAX_DATAGRAM_PAYLOAD,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use quinn_jls as quinn;
@@ -589,7 +589,6 @@ pub async fn proxy_via_spectre(
 
 // ==================== UDP via Spectre ====================
 
-use crate::udp::{FragmentReassembler, send_udp_over_quic, DEFAULT_MAX_DATAGRAM_PAYLOAD};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
