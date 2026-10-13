@@ -11,7 +11,7 @@ use crate::inbound::target::Target;
 use anyhow::{bail, Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
