@@ -548,6 +548,18 @@ pub async fn proxy_via_spectre(
     target: &Target,
     cfg: &Config,
 ) -> Result<()> {
+    proxy_via_spectre_with_preface(local, target, cfg, &[], &[]).await
+}
+
+/// Like [`proxy_via_spectre`], but writes `head` then `body` into the remote
+/// stream before relaying the local socket (absolute-form HTTP proxy).
+pub async fn proxy_via_spectre_with_preface(
+    local: &mut TcpStream,
+    target: &Target,
+    cfg: &Config,
+    head: &[u8],
+    body: &[u8],
+) -> Result<()> {
     let conn = get_or_connect(cfg).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let (host, port) = match target {
@@ -559,17 +571,35 @@ pub async fn proxy_via_spectre(
         padding: random_padding(8..32),
     };
     send.write_all(&req.encode()).await?;
-    let mut buf = vec![0u8; 512];
-    let n = recv.read(&mut buf).await?.ok_or_else(|| anyhow!("no connect response"))?;
-    if n < 1 || buf[0] != 0x00 {
-        bail!("spectre connect failed for {}", target.display());
+    let mut buf = vec![0u8; 1024];
+    let n = recv
+        .read(&mut buf)
+        .await?
+        .ok_or_else(|| anyhow!("no connect response"))?;
+    let mut reader = &buf[..n];
+    let resp = TcpConnectResponse::decode(&mut reader)
+        .map_err(|e| anyhow!("connect response: {e}"))?;
+    if !resp.ok {
+        bail!(
+            "spectre connect failed for {}: {}",
+            target.display(),
+            resp.message
+        );
+    }
+    if !head.is_empty() {
+        send.write_all(head).await?;
+    }
+    if !body.is_empty() {
+        send.write_all(body).await?;
     }
     let (mut lr, mut lw) = tokio::io::split(local);
     let a = async {
         let mut tmp = [0u8; 8192];
         loop {
             let n = lr.read(&mut tmp).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             send.write_all(&tmp[..n]).await?;
         }
         let _ = send.finish();
