@@ -1,98 +1,43 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use std::net::SocketAddr;
+use clap::Parser;
+use spectre::config::{Config, Mode};
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser)]
-#[command(name = "spectre", about = "Spectre - censorship-resistant QUIC proxy (JLS)")]
+#[derive(Parser, Debug)]
+#[command(name = "spectre", about = "Spectre QUIC proxy with JLS camouflage")]
 struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Server {
-        #[arg(short, long, default_value = "0.0.0.0:4433")]
-        listen: SocketAddr,
-        #[arg(short, long)]
-        password: String,
-        #[arg(short, long)]
-        username: Option<String>,
-        #[arg(long, default_value = "www.cloudflare.com:443")]
-        upstream: String,
-        #[arg(long, default_value = "www.cloudflare.com")]
-        server_name: String,
-    },
-    Client {
-        #[arg(short, long)]
-        server: SocketAddr,
-        #[arg(long, default_value = "www.cloudflare.com")]
-        server_name: String,
-        #[arg(short, long)]
-        password: String,
-        #[arg(short, long, default_value = "spectre")]
-        username: String,
-        #[arg(short, long, default_value = "127.0.0.1:1080")]
-        listen: SocketAddr,
-        /// Download rate, e.g. `200mbps` (bits/s) or `25000000` (bytes/s). 0 = BBR.
-        #[arg(long, default_value = "0", value_parser = spectre::brutal::parse_rate)]
-        rx: u64,
-        /// Upload rate, e.g. `50mbps` (bits/s) or `6250000` (bytes/s). 0 = BBR.
-        #[arg(long, default_value = "0", value_parser = spectre::brutal::parse_rate)]
-        tx: u64,
-        /// Optional local UDP listen address for datagram proxy
-        #[arg(long)]
-        udp_listen: Option<SocketAddr>,
-    },
+    /// Path to YAML config file
+    #[arg(short, long, value_name = "FILE")]
+    config: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let cfg = Config::load(&cli.config)?;
+
+    let level = cfg.log_level.as_deref().unwrap_or("info");
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("spectre=info".parse()?))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(format!("spectre={level}"))),
+        )
         .init();
 
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Server {
-            listen,
-            password,
-            username,
-            upstream,
-            server_name,
-        } => {
-            let cfg = spectre::server::ServerConfigYaml {
-                listen,
-                password,
-                username,
-                upstream: Some(upstream),
-                server_name: Some(server_name),
+    match cfg.mode {
+        Mode::Server => {
+            let server_cfg = spectre::server::ServerConfigYaml {
+                listen: cfg.server_listen()?,
+                password: cfg.password().to_string(),
+                username: Some(cfg.username().to_string()),
+                upstream: Some(cfg.upstream().to_string()),
+                server_name: Some(cfg.server_name().to_string()),
             };
-            spectre::server::run_server(cfg).await?;
+            spectre::server::run_server(server_cfg).await?;
         }
-        Commands::Client {
-            server,
-            server_name,
-            password,
-            username,
-            listen,
-            rx,
-            tx,
-            udp_listen,
-        } => {
-            let cfg = spectre::client::ClientConfigYaml {
-                server,
-                server_name,
-                username,
-                password,
-                listen,
-                rx_bps: rx,
-                tx_bps: tx,
-                udp_listen,
-            };
-            spectre::client::run_client(cfg).await?;
+        Mode::Client => {
+            spectre::client::run_client_from_config(cfg).await?;
         }
     }
     Ok(())

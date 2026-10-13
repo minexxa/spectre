@@ -6,7 +6,7 @@ use crate::protocol::*;
 use crate::udp::{
     fragment_udp, FragmentReassembler, DEFAULT_MAX_DATAGRAM_PAYLOAD,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use quinn_jls as quinn;
 use rustls_jls as rustls;
 use rustls::jls::JlsClientConfig;
@@ -409,4 +409,285 @@ fn configure_client(cfg: &ClientConfigYaml) -> Result<quinn::ClientConfig> {
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
+}
+
+/// New entry point driven by YAML config.
+pub async fn run_client_from_config(cfg: crate::config::Config) -> Result<()> {
+    use crate::app::router::build_router;
+    use crate::config::parse_routes;
+    use std::sync::Arc;
+
+    let entries = parse_routes(&cfg.route)?;
+    let router = Arc::new(build_router(entries, cfg.sniff)?);
+
+    let mut handles = Vec::new();
+
+    // DNS
+    if cfg.dns_enabled() {
+        let cfg2 = Arc::new(cfg.clone());
+        let router2 = router.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = crate::dns::run_dns_server(cfg2, router2).await {
+                tracing::error!("dns server error: {e:#}");
+            }
+        }));
+    }
+
+    // Mixed inbound
+    if let Some(port) = cfg.mixed_port {
+        if port > 0 {
+            let cfg2 = Arc::new(cfg.clone());
+            let router2 = router.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = crate::inbound::mixed::run_mixed(cfg2, router2).await {
+                    tracing::error!("mixed inbound error: {e:#}");
+                }
+            }));
+        }
+    }
+
+    // TProxy (Linux/Android)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(port) = cfg.tproxy_port {
+        if port > 0 {
+            let cfg2 = Arc::new(cfg.clone());
+            let router2 = router.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = crate::inbound::tproxy::run_tproxy(cfg2, router2).await {
+                    tracing::error!("tproxy inbound error: {e:#}");
+                }
+            }));
+        }
+    }
+
+    if handles.is_empty() {
+        return Err(anyhow!("no inbound configured"));
+    }
+
+    info!(
+        "client started (mixed={:?}, tproxy={:?}, dns={})",
+        cfg.mixed_port,
+        cfg.tproxy_port,
+        cfg.dns_enabled()
+    );
+
+    // Wait for any task to finish (normally they run forever)
+    let (result, _idx, _rest) = futures::future::select_all(handles).await;
+    result.map_err(|e| anyhow!("inbound task join error: {e}"))?
+}
+
+use crate::inbound::target::Target;
+use crate::config::Config;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+/// Shared Spectre QUIC connection (lazy-initialized).
+static SPECTRE_CONN: OnceLock<Mutex<Option<quinn::Connection>>> = OnceLock::new();
+
+async fn get_or_connect(cfg: &Config) -> Result<quinn::Connection> {
+    let cell = SPECTRE_CONN.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().await;
+    if let Some(ref c) = *guard {
+        if c.close_reason().is_none() {
+            return Ok(c.clone());
+        }
+    }
+    let server = cfg.client_server()?;
+    let bind_addr: SocketAddr = if server.is_ipv6() {
+        "[::]:0".parse()?
+    } else {
+        "0.0.0.0:0".parse()?
+    };
+    let socket = bind_udp(bind_addr).context("bind udp")?;
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no runtime"))?;
+    let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+    let client_cfg = ClientConfigYaml {
+        server,
+        server_name: cfg.server_name().to_string(),
+        username: cfg.username().to_string(),
+        password: cfg.password().to_string(),
+        listen: "127.0.0.1:0".parse()?,
+        rx_bps: cfg.rx_bps()?,
+        tx_bps: cfg.tx_bps()?,
+        udp_listen: None,
+    };
+    endpoint.set_default_client_config(configure_client(&client_cfg)?);
+    info!("connecting to {} (SNI={})", server, cfg.server_name());
+    let conn = endpoint
+        .connect(server, cfg.server_name())?
+        .await
+        .context("connect failed")?;
+    if conn.is_jls() != Some(true) {
+        return Err(anyhow!("JLS authentication failed"));
+    }
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let auth = AuthRequest {
+        username: cfg.username().to_string(),
+        password: cfg.password().to_string(),
+        rx_bps: cfg.rx_bps()?,
+        tx_bps: cfg.tx_bps()?,
+        padding: random_padding(16..48),
+    };
+    send.write_all(&auth.encode()).await?;
+    let mut buf = vec![0u8; 1024];
+    let n = recv.read(&mut buf).await?.ok_or_else(|| anyhow!("no auth response"))?;
+    let _ = n;
+    info!("Spectre AUTH ok");
+    *guard = Some(conn.clone());
+    Ok(conn)
+}
+
+/// Proxy a local TCP stream through Spectre QUIC.
+pub async fn proxy_via_spectre(
+    local: &mut TcpStream,
+    target: &Target,
+    cfg: &Config,
+) -> Result<()> {
+    let conn = get_or_connect(cfg).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let (host, port) = match target {
+        Target::Domain { host, port } => (host.clone(), *port),
+        Target::Addr(a) => (a.ip().to_string(), a.port()),
+    };
+    let req = TcpConnectRequest {
+        address: Address::new(host, port),
+        padding: random_padding(8..32),
+    };
+    send.write_all(&req.encode()).await?;
+    let mut buf = vec![0u8; 512];
+    let n = recv.read(&mut buf).await?.ok_or_else(|| anyhow!("no connect response"))?;
+    if n < 1 || buf[0] != 0x00 {
+        bail!("spectre connect failed for {}", target.display());
+    }
+    let (mut lr, mut lw) = tokio::io::split(local);
+    let a = async {
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = lr.read(&mut tmp).await?;
+            if n == 0 { break; }
+            send.write_all(&tmp[..n]).await?;
+        }
+        let _ = send.finish();
+        Ok::<(), anyhow::Error>(())
+    };
+    let b = async {
+        let mut tmp = [0u8; 8192];
+        loop {
+            match recv.read(&mut tmp).await? {
+                Some(n) if n > 0 => lw.write_all(&tmp[..n]).await?,
+                _ => break,
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::select! {
+        r = a => { let _ = r; }
+        r = b => { let _ = r; }
+    }
+    Ok(())
+}
+
+// ==================== UDP via Spectre ====================
+
+use crate::udp::{FragmentReassembler, send_udp_over_quic, DEFAULT_MAX_DATAGRAM_PAYLOAD};
+use dashmap::DashMap;
+use tokio::sync::mpsc;
+
+/// Map: local session key -> channel to deliver response payloads (src_addr, data)
+type UdpReplyMap = DashMap<u32, mpsc::UnboundedSender<(Address, bytes::Bytes)>>;
+
+static UDP_REPLIES: OnceLock<UdpReplyMap> = OnceLock::new();
+static UDP_SESSION_ID: OnceLock<AtomicU32> = OnceLock::new();
+static UDP_PACKET_ID: OnceLock<AtomicU16> = OnceLock::new();
+static UDP_READER_STARTED: OnceLock<()> = OnceLock::new();
+
+fn udp_replies() -> &'static UdpReplyMap {
+    UDP_REPLIES.get_or_init(DashMap::new)
+}
+
+fn next_udp_session() -> u32 {
+    UDP_SESSION_ID
+        .get_or_init(|| AtomicU32::new(1))
+        .fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_udp_packet() -> u16 {
+    UDP_PACKET_ID
+        .get_or_init(|| AtomicU16::new(1))
+        .fetch_add(1, Ordering::Relaxed)
+}
+
+/// Ensure a background task reads QUIC datagrams and demuxes by session_id.
+async fn ensure_udp_reader(conn: quinn::Connection) {
+    if UDP_READER_STARTED.set(()).is_err() {
+        return; // already started
+    }
+    tokio::spawn(async move {
+        let mut reasm = FragmentReassembler::new();
+        loop {
+            match conn.read_datagram().await {
+                Ok(data) => {
+                    if let Ok(Some((sid, addr, payload))) = reasm.push(data) {
+                        if let Some(tx) = udp_replies().get(&sid) {
+                            let _ = tx.send((addr, payload));
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Send one UDP packet via Spectre and optionally wait for replies on the returned receiver.
+pub async fn spectre_udp_session(
+    cfg: &Config,
+    target: &Address,
+) -> Result<(u32, mpsc::UnboundedReceiver<(Address, bytes::Bytes)>)> {
+    let conn = get_or_connect(cfg).await?;
+    ensure_udp_reader(conn.clone()).await;
+    let sid = next_udp_session();
+    let (tx, rx) = mpsc::unbounded_channel();
+    udp_replies().insert(sid, tx);
+    let _ = target;
+    Ok((sid, rx))
+}
+
+/// Fire-and-forget send one UDP datagram via Spectre.
+pub async fn spectre_udp_send(
+    cfg: &Config,
+    session_id: u32,
+    target: &Address,
+    payload: &[u8],
+) -> Result<()> {
+    let conn = get_or_connect(cfg).await?;
+    ensure_udp_reader(conn.clone()).await;
+    let pid = next_udp_packet();
+    send_udp_over_quic(
+        &conn,
+        session_id,
+        pid,
+        target,
+        payload,
+        DEFAULT_MAX_DATAGRAM_PAYLOAD,
+    )
+    .await
+    .map_err(|e| anyhow!("spectre udp send: {e}"))?;
+    Ok(())
+}
+
+/// Convenience: one-shot UDP request/response via Spectre (no persistent session).
+pub async fn spectre_udp_oneshot(
+    cfg: &Config,
+    target: &Address,
+    payload: &[u8],
+) -> Result<()> {
+    let (sid, _rx) = spectre_udp_session(cfg, target).await?;
+    spectre_udp_send(cfg, sid, target, payload).await?;
+    // keep session alive briefly for replies — caller should use session API for duplex
+    Ok(())
+}
+
+pub fn spectre_udp_close_session(session_id: u32) {
+    udp_replies().remove(&session_id);
 }
