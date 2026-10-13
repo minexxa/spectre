@@ -481,7 +481,7 @@ fn sendto_raw(socket: &Socket, packet: &[u8], dst: SocketAddr) -> Result<()> {
             packet.as_ptr() as *const libc::c_void,
             packet.len(),
             0,
-            dst_sa.as_ptr(),
+            dst_sa.as_ptr() as *const libc::sockaddr,
             dst_sa.len(),
         )
     };
