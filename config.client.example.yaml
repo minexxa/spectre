@@ -21,7 +21,6 @@ dns:
   port: 5353
   mode: fakeip                 # redir-host | fakeip
   route-hijack: true
-  rule-follow-route: true
   # Schemes: udp (default) | tcp | tls (DoT) | https (DoH)
   #   223.5.5.5
   #   udp://1.1.1.1:53
