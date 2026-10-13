@@ -177,7 +177,7 @@ async fn hijack_dns_tcp(stream: &mut TcpStream, router: Arc<Router>) -> Result<(
     loop {
         let mut len_buf = [0u8; 2];
         match stream.read_exact(&mut len_buf).await {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
         }
