@@ -41,6 +41,7 @@ dashmap = "6"
 # ARS ruleset matching (domain FST + regex)
 fst = "0.4"
 regex = "1"
+ring = "0.17"
 
 [profile.release]
 lto = true
