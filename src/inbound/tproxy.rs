@@ -157,7 +157,13 @@ async fn handle_tproxy_tcp(
 
     match decision.outbound {
         Outbound::Direct => {
-            let remote = TcpStream::connect(dest).await?;
+            let real = crate::inbound::target::resolve_direct(
+                &router,
+                dest,
+                domain.as_deref(),
+            )
+            .await?;
+            let remote = TcpStream::connect(real).await?;
             let (mut lr, mut lw) = tokio::io::split(&mut stream);
             let (mut rr, mut rw) = remote.into_split();
             tokio::select! {
@@ -166,7 +172,9 @@ async fn handle_tproxy_tcp(
             }
         }
         Outbound::Proxy => {
-            let tgt = if let Some(d) = domain {
+            // Prefer domain (sniffed or fakeip reverse) so server resolves real host
+            let host = domain.or_else(|| router.domain_for_fakeip(dest.ip()));
+            let tgt = if let Some(d) = host {
                 Target::from_host_port(&d, dest.port())
             } else {
                 Target::Addr(dest)
@@ -292,11 +300,21 @@ async fn udp_session_worker(
 
     match decision.outbound {
         Outbound::Direct => {
-            udp_direct_session(raw, peer, dest, first, rx).await
+            let real = crate::inbound::target::resolve_direct(
+                &router,
+                dest,
+                domain.as_deref(),
+            )
+            .await
+            .unwrap_or(dest);
+            udp_direct_session(raw, peer, dest, real, first, rx).await
         }
         Outbound::Proxy => {
-            let addr = if let Some(ref d) = domain {
-                Address::new(d.clone(), dest.port())
+            let host = domain
+                .clone()
+                .or_else(|| router.domain_for_fakeip(dest.ip()));
+            let addr = if let Some(d) = host {
+                Address::new(d, dest.port())
             } else {
                 Address::new(dest.ip().to_string(), dest.port())
             };
@@ -339,17 +357,20 @@ async fn hijack_dns_udp(
 async fn udp_direct_session(
     raw: Arc<RawSockets>,
     peer: SocketAddr,
+    /// Original destination (for source-spoofed replies).
     dest: SocketAddr,
+    /// Real dial address (after fake-ip reverse resolve).
+    real: SocketAddr,
     first: Vec<u8>,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    let bind = if dest.is_ipv4() {
+    let bind = if real.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
     };
     let sock = UdpSocket::bind(bind).await?;
-    sock.send_to(&first, dest).await?;
+    sock.send_to(&first, real).await?;
 
     let mut rbuf = vec![0u8; 65535];
     let mut deadline = tokio::time::Instant::now() + UDP_IDLE;
@@ -358,7 +379,7 @@ async fn udp_direct_session(
             pkt = rx.recv() => {
                 match pkt {
                     Some(d) => {
-                        if let Err(e) = sock.send_to(&d, dest).await {
+                        if let Err(e) = sock.send_to(&d, real).await {
                             debug!("tproxy udp direct send: {e}");
                             break;
                         }

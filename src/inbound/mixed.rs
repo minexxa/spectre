@@ -378,7 +378,15 @@ async fn dispatch_tcp(
     match decision.outbound {
         Outbound::Direct => {
             let remote = match &target {
-                Target::Addr(a) => TcpStream::connect(a).await?,
+                Target::Addr(a) => {
+                    let real = crate::inbound::target::resolve_direct(
+                        &router,
+                        *a,
+                        domain.as_deref(),
+                    )
+                    .await?;
+                    TcpStream::connect(real).await?
+                }
                 Target::Domain { host, port } => {
                     TcpStream::connect((host.as_str(), *port)).await?
                 }
@@ -391,7 +399,17 @@ async fn dispatch_tcp(
             }
         }
         Outbound::Proxy => {
-            crate::client::proxy_via_spectre(local, &target, &cfg).await?;
+            // Prefer domain over fake-ip for remote resolution
+            let tgt = if let Target::Addr(a) = &target {
+                if let Some(d) = router.domain_for_fakeip(a.ip()) {
+                    Target::from_host_port(&d, a.port())
+                } else {
+                    target.clone()
+                }
+            } else {
+                target.clone()
+            };
+            crate::client::proxy_via_spectre(local, &tgt, &cfg).await?;
         }
     }
     Ok(())
