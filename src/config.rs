@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 /// Top-level config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// `server` or `client`
+    /// `server` or `client` (default: client).
+    #[serde(default)]
     pub mode: Mode,
 
-    /// Bind address for mixed / tproxy / dns (default 127.0.0.1).
-    #[serde(default = "default_bind_address", rename = "bind-address")]
-    pub bind_address: String,
+    /// Bind address for mixed / tproxy / dns / server listen.
+    /// Default: `127.0.0.1` (client), `0.0.0.0` (server). Omit to use default.
+    #[serde(default, rename = "bind-address")]
+    pub bind_address: Option<String>,
 
     #[serde(default, rename = "log-level")]
     pub log_level: Option<String>,
@@ -69,10 +71,11 @@ pub struct ProxyConfig {
     pub tx: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Server,
+    #[default]
     Client,
 }
 
@@ -103,9 +106,6 @@ pub struct DnsConfig {
     pub cache_size: usize,
 }
 
-fn default_bind_address() -> String {
-    "127.0.0.1".into()
-}
 fn default_true() -> bool {
     true
 }
@@ -124,6 +124,13 @@ impl Config {
     }
 
     fn validate(&mut self, config_path: &Path) -> Result<()> {
+        // Mode-dependent default for bind-address when omitted.
+        if self.bind_address.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+            self.bind_address = Some(match self.mode {
+                Mode::Client => "127.0.0.1".into(),
+                Mode::Server => "0.0.0.0".into(),
+            });
+        }
         match self.mode {
             Mode::Server => {
                 if self.proxy.port.unwrap_or(0) == 0 {
@@ -174,10 +181,10 @@ impl Config {
         if port == 0 {
             bail!("proxy.port is required in server mode");
         }
-        let ip: std::net::IpAddr = self
-            .bind_address
+        let bind = self.bind_address_str();
+        let ip: std::net::IpAddr = bind
             .parse()
-            .with_context(|| format!("parse bind-address `{}`", self.bind_address))?;
+            .with_context(|| format!("parse bind-address `{bind}`"))?;
         Ok(SocketAddr::new(ip, port))
     }
 
@@ -198,6 +205,14 @@ impl Config {
             format!("{host}:{port}")
         };
         s.parse().with_context(|| format!("parse proxy.server+port `{s}`"))
+    }
+
+    /// Effective bind address after applying mode defaults.
+    pub fn bind_address_str(&self) -> &str {
+        self.bind_address.as_deref().unwrap_or(match self.mode {
+            Mode::Client => "127.0.0.1",
+            Mode::Server => "0.0.0.0",
+        })
     }
 
     pub fn password(&self) -> &str {
