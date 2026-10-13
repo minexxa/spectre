@@ -105,11 +105,11 @@ pub struct DnsConfig {
     #[serde(default = "default_cache_size", rename = "cache-size")]
     pub cache_size: usize,
 
-    /// IPv4 fake-ip pool, e.g. `198.18.0.0/16`.
+    /// IPv4 fake-ip pool. Default in fakeip mode: `198.18.0.0/15`.
     #[serde(default, rename = "fakeip-range")]
     pub fakeip_range: Option<String>,
 
-    /// IPv6 fake-ip pool, e.g. `fc00::/18`.
+    /// IPv6 fake-ip pool. Default in fakeip mode: `fc00::/18`.
     #[serde(default, rename = "fakeip6-range")]
     pub fakeip6_range: Option<String>,
 
@@ -187,6 +187,7 @@ impl Config {
                 }
                 self.dns.mode = mode;
                 if self.dns.mode == "fakeip" {
+                    // Defaults when omitted: 198.18.0.0/15 and fc00::/18.
                     let empty_v4 = self
                         .dns
                         .fakeip_range
@@ -199,8 +200,11 @@ impl Config {
                         .as_ref()
                         .map(|s| s.is_empty())
                         .unwrap_or(true);
-                    if empty_v4 && empty_v6 {
-                        bail!("fakeip mode requires fakeip-range and/or fakeip6-range");
+                    if empty_v4 {
+                        self.dns.fakeip_range = Some("198.18.0.0/15".into());
+                    }
+                    if empty_v6 {
+                        self.dns.fakeip6_range = Some("fc00::/18".into());
                     }
                     let fmode = self.dns.fakeip_filter_mode.to_ascii_lowercase();
                     if fmode != "blacklist" && fmode != "whitelist" {
