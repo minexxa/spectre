@@ -223,27 +223,27 @@ async fn run_tproxy_udp(bind: SocketAddr, router: Arc<Router>, cfg: Arc<Config>)
         let data = buf[..n].to_vec();
         let key = (peer, dest);
 
-        // Fast path: existing session
+        // Fast path: existing session (try_send: never block the recv loop)
         {
             let map = nat.lock().await;
             if let Some(tx) = map.get(&key) {
-                let _ = tx.send(data).await;
+                let _ = tx.try_send(data);
                 continue;
             }
         }
 
         // New session
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
         {
             let mut map = nat.lock().await;
             // double-check
             if let Some(existing) = map.get(&key) {
-                let _ = existing.send(data).await;
+                let _ = existing.try_send(data);
                 continue;
             }
             map.insert(key, tx.clone());
         }
-        let _ = tx.send(data).await;
+        let _ = tx.try_send(data);
 
         let raw2 = raw.clone();
         let router2 = router.clone();
@@ -471,8 +471,20 @@ async fn recv_tproxy_udp(
     sock: &UdpSocket,
     buf: &mut [u8],
 ) -> io::Result<(usize, SocketAddr, SocketAddr)> {
-    sock.readable().await?;
-    recvmsg_origdst(sock.as_raw_fd(), buf)
+    // Must use try_io so a WouldBlock clears the readiness interest; otherwise
+    // readable().await returns immediately forever and spins one core. (same as ant)
+    use tokio::io::Interest;
+    loop {
+        let ready = sock.ready(Interest::READABLE).await?;
+        if !ready.is_readable() {
+            continue;
+        }
+        match sock.try_io(Interest::READABLE, || recvmsg_origdst(sock.as_raw_fd(), buf)) {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn recvmsg_origdst(fd: i32, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, SocketAddr)> {
