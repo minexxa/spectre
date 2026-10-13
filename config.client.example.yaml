@@ -19,11 +19,17 @@ proxy:
 
 dns:
   port: 5353
+  mode: fakeip                 # redir-host | fakeip
   route-hijack: true
   rule-follow-route: true
   direct-nameserver: 223.5.5.5
   proxy-nameserver: 1.1.1.1
   cache-size: 4096
+  fakeip-range: 198.18.0.0/16
+  # fakeip6-range: fc00::/18
+  fakeip-filter-mode: blacklist  # blacklist | whitelist
+  # fakeip-filter:
+  #   - ./rules/private.ars
 
 route:
   - direct,./rules/cn-ip.ars
