@@ -46,20 +46,21 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProxyConfig {
     // ---- server ----
-    /// Listen port; bind address comes from top-level `bind-address`.
+    /// Listen port (server mode); bind address from top-level `bind-address`.
+    /// Also used as remote port in client mode.
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default)]
     pub password: Option<String>,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default, rename = "server-name")]
-    pub server_name: Option<String>,
+    #[serde(default, rename = "user", alias = "username")]
+    pub user: Option<String>,
+    #[serde(default, rename = "sni", alias = "server-name")]
+    pub sni: Option<String>,
     #[serde(default)]
     pub upstream: Option<String>,
 
     // ---- client ----
-    /// Remote Spectre server `host:port`.
+    /// Remote Spectre server host (no port).
     #[serde(default)]
     pub server: Option<String>,
     #[serde(default)]
@@ -133,8 +134,11 @@ impl Config {
                 }
             }
             Mode::Client => {
-                if self.proxy.server.is_none() {
+                if self.proxy.server.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
                     bail!("client mode requires `proxy.server`");
+                }
+                if self.proxy.port.unwrap_or(0) == 0 {
+                    bail!("client mode requires `proxy.port`");
                 }
                 if self.proxy.password.is_none() {
                     bail!("client mode requires `proxy.password`");
@@ -178,12 +182,22 @@ impl Config {
     }
 
     pub fn client_server(&self) -> Result<SocketAddr> {
-        self.proxy
+        let host = self
+            .proxy
             .server
             .as_ref()
-            .unwrap()
-            .parse()
-            .context("parse proxy.server")
+            .context("proxy.server required")?;
+        let port = self.proxy.port.unwrap_or(0);
+        if port == 0 {
+            bail!("proxy.port required in client mode");
+        }
+        // host may be IPv6 without brackets
+        let s = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        s.parse().with_context(|| format!("parse proxy.server+port `{s}`"))
     }
 
     pub fn password(&self) -> &str {
@@ -191,14 +205,11 @@ impl Config {
     }
 
     pub fn username(&self) -> &str {
-        self.proxy.username.as_deref().unwrap_or("spectre")
+        self.proxy.user.as_deref().unwrap_or("spectre")
     }
 
     pub fn server_name(&self) -> &str {
-        self.proxy
-            .server_name
-            .as_deref()
-            .unwrap_or("www.cloudflare.com")
+        self.proxy.sni.as_deref().unwrap_or("www.cloudflare.com")
     }
 
     pub fn upstream(&self) -> &str {
