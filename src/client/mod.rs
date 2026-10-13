@@ -7,8 +7,6 @@ pub mod inbound;
 pub mod dns;
 pub mod ruleset;
 
-//! Spectre client — QUIC + JLS (rustls-jls / quinn-jls).
-
 use crate::protocol::brutal::{bind_udp, tune_transport, BrutalHandle};
 use crate::protocol::relay::relay;
 use crate::protocol::*;
