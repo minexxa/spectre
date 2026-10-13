@@ -18,25 +18,9 @@ pub struct Config {
     #[serde(default, rename = "log-level")]
     pub log_level: Option<String>,
 
-    // ---- server ----
+    /// Spectre node settings (client remote / server local). Same level as `route`.
     #[serde(default)]
-    pub listen: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default, rename = "server-name")]
-    pub server_name: Option<String>,
-    #[serde(default)]
-    pub upstream: Option<String>,
-
-    // ---- client ----
-    #[serde(default)]
-    pub server: Option<String>,
-    #[serde(default)]
-    pub rx: Option<String>,
-    #[serde(default)]
-    pub tx: Option<String>,
+    pub proxy: ProxyConfig,
 
     /// Mixed inbound port (HTTP CONNECT + SOCKS4/4a/5), TCP+UDP.
     #[serde(default, rename = "mixed-port")]
@@ -56,6 +40,32 @@ pub struct Config {
     /// Route rules: `direct,/path/xxx.ars` | `proxy,/path/yyy.ars` | `direct` | `proxy`
     #[serde(default)]
     pub route: Vec<String>,
+}
+
+/// Node / endpoint configuration under top-level `proxy:`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProxyConfig {
+    // ---- server ----
+    /// Listen port; bind address comes from top-level `bind-address`.
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default, rename = "server-name")]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub upstream: Option<String>,
+
+    // ---- client ----
+    /// Remote Spectre server `host:port`.
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub rx: Option<String>,
+    #[serde(default)]
+    pub tx: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -104,10 +114,10 @@ fn default_cache_size() -> usize {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read config {path:?}"))?;
-        let mut cfg: Config = serde_yaml::from_str(&text)
-            .with_context(|| format!("parse config {path:?}"))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read config {path:?}"))?;
+        let mut cfg: Config =
+            serde_yaml::from_str(&text).with_context(|| format!("parse config {path:?}"))?;
         cfg.validate(path)?;
         Ok(cfg)
     }
@@ -115,30 +125,30 @@ impl Config {
     fn validate(&mut self, config_path: &Path) -> Result<()> {
         match self.mode {
             Mode::Server => {
-                if self.listen.is_none() {
-                    bail!("server mode requires `listen`");
+                if self.proxy.port.unwrap_or(0) == 0 {
+                    bail!("server mode requires `proxy.port`");
                 }
-                if self.password.is_none() {
-                    bail!("server mode requires `password`");
+                if self.proxy.password.is_none() {
+                    bail!("server mode requires `proxy.password`");
                 }
             }
             Mode::Client => {
-                if self.server.is_none() {
-                    bail!("client mode requires `server`");
+                if self.proxy.server.is_none() {
+                    bail!("client mode requires `proxy.server`");
                 }
-                if self.password.is_none() {
-                    bail!("client mode requires `password`");
+                if self.proxy.password.is_none() {
+                    bail!("client mode requires `proxy.password`");
                 }
                 if self.mixed_port.is_none() && self.tproxy_port.unwrap_or(0) == 0 {
                     bail!("client mode requires at least one of `mixed-port` / `tproxy-port`");
                 }
                 if self.dns.route_hijack && !self.dns_enabled() {
-                    bail!("dns.route-hijack requires DNS module enabled (set dns.port and/or nameservers)");
+                    bail!(
+                        "dns.route-hijack requires DNS module enabled (set dns.port and/or nameservers)"
+                    );
                 }
                 // Resolve relative ARS paths against config file directory.
-                let base = config_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."));
+                let base = config_path.parent().unwrap_or_else(|| Path::new("."));
                 for rule in &mut self.route {
                     if let Some((outbound, path_part)) = rule.split_once(',') {
                         let p = path_part.trim();
@@ -153,49 +163,60 @@ impl Config {
         Ok(())
     }
 
-    // ---- helpers ----
+    // ---- helpers (read from proxy:) ----
 
     pub fn server_listen(&self) -> Result<SocketAddr> {
-        self.listen
-            .as_ref()
-            .unwrap()
+        let port = self.proxy.port.unwrap_or(0);
+        if port == 0 {
+            bail!("proxy.port is required in server mode");
+        }
+        let ip: std::net::IpAddr = self
+            .bind_address
             .parse()
-            .context("parse listen address")
+            .with_context(|| format!("parse bind-address `{}`", self.bind_address))?;
+        Ok(SocketAddr::new(ip, port))
     }
 
     pub fn client_server(&self) -> Result<SocketAddr> {
-        self.server
+        self.proxy
+            .server
             .as_ref()
             .unwrap()
             .parse()
-            .context("parse server address")
+            .context("parse proxy.server")
     }
 
     pub fn password(&self) -> &str {
-        self.password.as_deref().unwrap_or("")
+        self.proxy.password.as_deref().unwrap_or("")
     }
 
     pub fn username(&self) -> &str {
-        self.username.as_deref().unwrap_or("spectre")
+        self.proxy.username.as_deref().unwrap_or("spectre")
     }
 
     pub fn server_name(&self) -> &str {
-        self.server_name.as_deref().unwrap_or("www.cloudflare.com")
+        self.proxy
+            .server_name
+            .as_deref()
+            .unwrap_or("www.cloudflare.com")
     }
 
     pub fn upstream(&self) -> &str {
-        self.upstream.as_deref().unwrap_or("www.cloudflare.com:443")
+        self.proxy
+            .upstream
+            .as_deref()
+            .unwrap_or("www.cloudflare.com:443")
     }
 
     pub fn rx_bps(&self) -> Result<u64> {
-        match &self.rx {
+        match &self.proxy.rx {
             Some(s) => crate::brutal::parse_rate(s).map_err(|e| anyhow::anyhow!("{e}")),
             None => Ok(0),
         }
     }
 
     pub fn tx_bps(&self) -> Result<u64> {
-        match &self.tx {
+        match &self.proxy.tx {
             Some(s) => crate::brutal::parse_rate(s).map_err(|e| anyhow::anyhow!("{e}")),
             None => Ok(0),
         }
@@ -204,7 +225,8 @@ impl Config {
     /// Whether the DNS module should run (listen and/or route-hijack).
     pub fn dns_enabled(&self) -> bool {
         let has_port = matches!(self.dns.port, Some(p) if p > 0);
-        let has_ns = self.dns.direct_nameserver.is_some() || self.dns.proxy_nameserver.is_some();
+        let has_ns =
+            self.dns.direct_nameserver.is_some() || self.dns.proxy_nameserver.is_some();
         has_port || (self.dns.route_hijack && has_ns)
     }
 
@@ -218,7 +240,10 @@ impl Config {
 #[derive(Debug, Clone)]
 pub enum RouteEntry {
     /// Match an ARS file → given outbound.
-    RuleSet { outbound: OutboundKind, path: PathBuf },
+    RuleSet {
+        outbound: OutboundKind,
+        path: PathBuf,
+    },
     /// Final MATCH.
     Match(OutboundKind),
 }
@@ -255,7 +280,6 @@ impl RouteEntry {
 /// Parse the full route list; last entry must be a Match.
 pub fn parse_routes(routes: &[String]) -> Result<Vec<RouteEntry>> {
     if routes.is_empty() {
-        // Default: everything goes to proxy.
         return Ok(vec![RouteEntry::Match(OutboundKind::Proxy)]);
     }
     let mut out = Vec::with_capacity(routes.len());
