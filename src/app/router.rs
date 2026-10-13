@@ -1,9 +1,12 @@
 //! Simplified router: RULE-SET (ARS) + MATCH → Direct | Proxy(Spectre).
+//! Fake-IP pool + reverse mapping (aligned with ant).
 
 use crate::config::{OutboundKind, RouteEntry};
+use crate::dns::fakeip::FakeIpPool;
 use crate::ruleset::RuleSet;
 use anyhow::Result;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,32 +24,62 @@ pub struct RouteMatch {
 pub struct Router {
     rules: Vec<(RouteEntry, Option<Arc<RuleSet>>)>,
     sniff: bool,
-    /// When true, tproxy/mixed should feed DNS queries into the local DNS module.
     hijack_dns: bool,
+    fakeip: bool,
+    fakeip_pool: Option<FakeIpPool>,
+    /// Filter rulesets for fakeip blacklist/whitelist.
+    fakeip_filters: Vec<Arc<RuleSet>>,
+    fakeip_whitelist: bool,
 }
 
 impl Router {
-    pub fn new(
-        entries: Vec<RouteEntry>,
-        rulesets: Vec<Option<Arc<RuleSet>>>,
-        sniff: bool,
-        hijack_dns: bool,
-    ) -> Self {
-        assert_eq!(entries.len(), rulesets.len());
-        let rules = entries.into_iter().zip(rulesets).collect();
-        Self {
-            rules,
-            sniff,
-            hijack_dns,
-        }
-    }
-
     pub fn sniff_enabled(&self) -> bool {
         self.sniff
     }
 
     pub fn hijack_dns(&self) -> bool {
         self.hijack_dns
+    }
+
+    pub fn fakeip_enabled(&self) -> bool {
+        self.fakeip
+    }
+
+    pub fn has_fakeip_v4(&self) -> bool {
+        self.fakeip_pool.as_ref().map(|p| p.has_v4()).unwrap_or(false)
+    }
+
+    pub fn has_fakeip_v6(&self) -> bool {
+        self.fakeip_pool.as_ref().map(|p| p.has_v6()).unwrap_or(false)
+    }
+
+    /// Blacklist: true unless domain hits a filter ruleset.
+    /// Whitelist: true only if domain hits a filter ruleset.
+    pub fn use_fakeip(&self, domain: &str) -> bool {
+        if !self.fakeip || domain.is_empty() {
+            return false;
+        }
+        let hit = self
+            .fakeip_filters
+            .iter()
+            .any(|rs| rs.match_domain(domain));
+        if self.fakeip_whitelist {
+            hit
+        } else {
+            !hit
+        }
+    }
+
+    pub fn allocate_fakeip(&self, domain: &str, v6: bool) -> Option<IpAddr> {
+        self.fakeip_pool.as_ref()?.allocate(domain, v6)
+    }
+
+    pub fn domain_for_fakeip(&self, ip: IpAddr) -> Option<String> {
+        let pool = self.fakeip_pool.as_ref()?;
+        if !pool.contains(ip) {
+            return None;
+        }
+        pool.domain_of(ip)
     }
 
     pub fn match_domain(&self, domain: &str) -> RouteMatch {
@@ -77,6 +110,10 @@ impl Router {
     }
 
     pub fn match_ip(&self, ip: IpAddr) -> RouteMatch {
+        // Fake-IP → route by original domain
+        if let Some(domain) = self.domain_for_fakeip(ip) {
+            return self.match_domain(&domain);
+        }
         for (entry, rs) in &self.rules {
             match entry {
                 RouteEntry::RuleSet { outbound, path } => {
@@ -103,7 +140,6 @@ impl Router {
         }
     }
 
-    /// DNS upstream decision under rule-follow-route.
     pub fn dns_outbound_for_domain(&self, domain: &str) -> Outbound {
         self.match_domain(domain).outbound
     }
@@ -116,7 +152,17 @@ fn outbound_to(k: &OutboundKind) -> Outbound {
     }
 }
 
-pub fn build_router(entries: Vec<RouteEntry>, sniff: bool, hijack_dns: bool) -> Result<Router> {
+pub fn build_router(
+    entries: Vec<RouteEntry>,
+    sniff: bool,
+    hijack_dns: bool,
+    fakeip: bool,
+    fakeip_range: Option<&str>,
+    fakeip6_range: Option<&str>,
+    fakeip_filter_paths: &[String],
+    fakeip_whitelist: bool,
+    config_dir: &Path,
+) -> Result<Router> {
     let mut rulesets = Vec::with_capacity(entries.len());
     for e in &entries {
         match e {
@@ -136,5 +182,53 @@ pub fn build_router(entries: Vec<RouteEntry>, sniff: bool, hijack_dns: bool) -> 
             RouteEntry::Match(_) => rulesets.push(None),
         }
     }
-    Ok(Router::new(entries, rulesets, sniff, hijack_dns))
+
+    let fakeip_pool = if fakeip {
+        Some(FakeIpPool::new(fakeip_range, fakeip6_range)?)
+    } else {
+        None
+    };
+
+    let mut fakeip_filters = Vec::new();
+    if fakeip {
+        for p in fakeip_filter_paths {
+            let path = resolve_path(config_dir, p);
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("filter");
+            match crate::ruleset::load_file(name, &path) {
+                Ok(rs) => {
+                    tracing::info!(
+                        "loaded fakeip-filter {} ({} rules)",
+                        path.display(),
+                        rs.rule_count
+                    );
+                    fakeip_filters.push(Arc::new(rs));
+                }
+                Err(e) => {
+                    tracing::warn!("fakeip-filter {}: {e:#}", path.display());
+                }
+            }
+        }
+    }
+
+    Ok(Router {
+        rules: entries.into_iter().zip(rulesets).collect(),
+        sniff,
+        hijack_dns,
+        fakeip,
+        fakeip_pool,
+        fakeip_filters,
+        fakeip_whitelist,
+    })
+}
+
+fn resolve_path(base: &Path, p: &str) -> PathBuf {
+    let path = PathBuf::from(p);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
