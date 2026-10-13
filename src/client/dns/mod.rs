@@ -1,4 +1,4 @@
-//! Minimal local DNS: UDP listen + rule-follow-route + cache + route-hijack.
+//! Minimal local DNS: UDP listen + route-based upstream + cache + route-hijack.
 
 mod cache;
 mod fakeip;
@@ -23,7 +23,6 @@ static ENGINE: OnceLock<Arc<DnsEngine>> = OnceLock::new();
 pub struct DnsEngine {
     direct_ns: Option<DnsUpstream>,
     proxy_ns: Option<DnsUpstream>,
-    rule_follow: bool,
     cache: Option<Arc<DnsCache>>,
 }
 
@@ -49,7 +48,6 @@ impl DnsEngine {
         Ok(Self {
             direct_ns,
             proxy_ns,
-            rule_follow: cfg.dns.rule_follow_route,
             cache,
         })
     }
@@ -131,17 +129,15 @@ async fn answer_with(eng: &DnsEngine, query: &[u8], router: &Router) -> Result<V
         }
     }
 
-    let upstream = if eng.rule_follow {
-        let ob = router.dns_outbound_for_domain(&domain);
-        match ob {
-            Outbound::Direct => eng.direct_ns.as_ref(),
-            Outbound::Proxy => eng.proxy_ns.as_ref(),
-        }
-        .or(eng.proxy_ns.as_ref())
-        .or(eng.direct_ns.as_ref())
-    } else {
-        eng.proxy_ns.as_ref().or(eng.direct_ns.as_ref())
-    };
+    // Always follow route: domain → Direct/Proxy → matching nameserver,
+    // with fallback to the other side if the preferred one is unset.
+    let ob = router.dns_outbound_for_domain(&domain);
+    let upstream = match ob {
+        Outbound::Direct => eng.direct_ns.as_ref(),
+        Outbound::Proxy => eng.proxy_ns.as_ref(),
+    }
+    .or(eng.proxy_ns.as_ref())
+    .or(eng.direct_ns.as_ref());
 
     let upstream = match upstream {
         Some(u) => u,
@@ -184,20 +180,18 @@ pub async fn run_dns_server(cfg: Arc<Config>, router: Arc<Router>) -> Result<()>
     };
 
     let eng = init_engine(&cfg)?;
-    if cfg.dns.rule_follow_route {
-        info!(
-            "dns rule-follow-route=true direct={} proxy={} route-hijack={}",
-            eng.direct_ns
-                .as_ref()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "-".into()),
-            eng.proxy_ns
-                .as_ref()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "-".into()),
-            cfg.dns.route_hijack,
-        );
-    }
+    info!(
+        "dns direct={} proxy={} route-hijack={}",
+        eng.direct_ns
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "-".into()),
+        eng.proxy_ns
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "-".into()),
+        cfg.dns.route_hijack,
+    );
 
     let mut handles = Vec::new();
     for bind in sockopt::listen_addrs(cfg.bind_address_str(), port) {
