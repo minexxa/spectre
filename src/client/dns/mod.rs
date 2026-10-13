@@ -8,8 +8,8 @@ pub use cache::DnsCache;
 pub use fakeip::FakeIpPool;
 pub use upstream::{exchange, parse_nameserver, DnsUpstream};
 
-use crate::client::router::{Outbound, Router};
-use crate::client::sockopt;
+use crate::client::app::router::{Outbound, Router};
+use crate::client::app::sockopt;
 use crate::config::Config;
 use anyhow::{bail, Result};
 use std::sync::{Arc, OnceLock};
