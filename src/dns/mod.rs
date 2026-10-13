@@ -160,7 +160,7 @@ pub async fn run_dns_server(cfg: Arc<Config>, router: Arc<Router>) -> Result<()>
     }
 
     let mut handles = Vec::new();
-    for bind in sockopt::listen_addrs(&cfg.bind_address, port) {
+    for bind in sockopt::listen_addrs(cfg.bind_address_str(), port) {
         match sockopt::bind_udp(bind).await {
             Ok(sock) => {
                 info!("DNS listening on UDP {bind}");
