@@ -1,5 +1,6 @@
-mode: client
-bind-address: 127.0.0.1
+# mode defaults to client; bind-address defaults to 127.0.0.1
+# mode: client
+# bind-address: 127.0.0.1
 log-level: info
 
 mixed-port: 1080
@@ -7,7 +8,6 @@ mixed-port: 1080
 
 sniff: true
 
-# Spectre node (same level as route)
 proxy:
   server: 1.2.3.4
   port: 4433
