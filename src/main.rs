@@ -25,7 +25,7 @@ enum Commands {
     /// Convert mihomo YAML / text / sing-box JSON ruleset → binary `.ars`
     #[command(name = "convert-ruleset", visible_alias = "ruleset-convert")]
     ConvertRuleset {
-        /// Input: `.yaml`/`.yml` (mihomo payload or classical text) or `.json` (sing-box)
+        /// Input: mihomo YAML (`payload:`) or plain text rules
         #[arg(short = 'i', long = "input", value_name = "FILE")]
         input: PathBuf,
 
