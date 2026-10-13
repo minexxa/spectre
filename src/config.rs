@@ -82,9 +82,13 @@ pub enum Mode {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DnsConfig {
     /// Local DNS UDP listen port. Omit / 0 = do not listen
-    /// (DNS module can still run for route-hijack only).
+    /// (DNS module can still run for route-hijack / fakeip only).
     #[serde(default)]
     pub port: Option<u16>,
+
+    /// `redir-host` (default) or `fakeip`.
+    #[serde(default = "default_dns_mode")]
+    pub mode: String,
 
     /// When true (default), DNS upstream follows route decision.
     #[serde(default = "default_true", rename = "rule-follow-route")]
@@ -104,6 +108,29 @@ pub struct DnsConfig {
 
     #[serde(default = "default_cache_size", rename = "cache-size")]
     pub cache_size: usize,
+
+    /// IPv4 fake-ip pool, e.g. `198.18.0.0/16`.
+    #[serde(default, rename = "fakeip-range")]
+    pub fakeip_range: Option<String>,
+
+    /// IPv6 fake-ip pool, e.g. `fc00::/18`.
+    #[serde(default, rename = "fakeip6-range")]
+    pub fakeip6_range: Option<String>,
+
+    /// ARS paths for fakeip filter (blacklist exclude / whitelist include).
+    #[serde(default, rename = "fakeip-filter")]
+    pub fakeip_filter: Vec<String>,
+
+    /// `blacklist` (default) or `whitelist`.
+    #[serde(default = "default_fakeip_filter_mode", rename = "fakeip-filter-mode")]
+    pub fakeip_filter_mode: String,
+}
+
+fn default_dns_mode() -> String {
+    "redir-host".into()
+}
+fn default_fakeip_filter_mode() -> String {
+    "blacklist".into()
 }
 
 fn default_true() -> bool {
@@ -158,6 +185,38 @@ impl Config {
                         "dns.route-hijack requires DNS module enabled (set dns.port and/or nameservers)"
                     );
                 }
+                let mode = self.dns.mode.to_ascii_lowercase();
+                if mode != "redir-host" && mode != "fakeip" {
+                    bail!("dns.mode must be redir-host or fakeip");
+                }
+                self.dns.mode = mode;
+                if self.dns.mode == "fakeip" {
+                    let empty_v4 = self
+                        .dns
+                        .fakeip_range
+                        .as_ref()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true);
+                    let empty_v6 = self
+                        .dns
+                        .fakeip6_range
+                        .as_ref()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true);
+                    if empty_v4 && empty_v6 {
+                        bail!("fakeip mode requires fakeip-range and/or fakeip6-range");
+                    }
+                    let fmode = self.dns.fakeip_filter_mode.to_ascii_lowercase();
+                    if fmode != "blacklist" && fmode != "whitelist" {
+                        bail!("dns.fakeip-filter-mode must be blacklist or whitelist");
+                    }
+                    self.dns.fakeip_filter_mode = fmode;
+                    if self.dns.fakeip_filter_mode == "whitelist"
+                        && self.dns.fakeip_filter.is_empty()
+                    {
+                        bail!("fakeip-filter-mode=whitelist requires non-empty fakeip-filter");
+                    }
+                }
                 // Resolve relative ARS paths against config file directory.
                 let base = config_path.parent().unwrap_or_else(|| Path::new("."));
                 for rule in &mut self.route {
@@ -167,6 +226,12 @@ impl Config {
                             let abs = base.join(p);
                             *rule = format!("{},{}", outbound.trim(), abs.display());
                         }
+                    }
+                }
+                for f in &mut self.dns.fakeip_filter {
+                    let p = f.trim();
+                    if !p.is_empty() && !Path::new(p).is_absolute() {
+                        *f = base.join(p).display().to_string();
                     }
                 }
             }
@@ -248,12 +313,17 @@ impl Config {
         }
     }
 
-    /// Whether the DNS module should run (listen and/or route-hijack).
+    /// Whether the DNS module should run (listen / route-hijack / fakeip).
     pub fn dns_enabled(&self) -> bool {
         let has_port = matches!(self.dns.port, Some(p) if p > 0);
         let has_ns =
             self.dns.direct_nameserver.is_some() || self.dns.proxy_nameserver.is_some();
-        has_port || (self.dns.route_hijack && has_ns)
+        let fakeip = self.dns.mode.eq_ignore_ascii_case("fakeip");
+        has_port || (self.dns.route_hijack && has_ns) || fakeip
+    }
+
+    pub fn fakeip_enabled(&self) -> bool {
+        self.dns.mode.eq_ignore_ascii_case("fakeip")
     }
 
     /// DNS route-hijack active (tproxy/mixed steals DNS into local module).

@@ -11,6 +11,7 @@ use quinn_jls as quinn;
 use rustls_jls as rustls;
 use rustls::jls::JlsClientConfig;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -419,7 +420,18 @@ pub async fn run_client_from_config(cfg: crate::config::Config) -> Result<()> {
 
     let entries = parse_routes(&cfg.route)?;
     let hijack = cfg.dns_route_hijack();
-    let router = Arc::new(build_router(entries, cfg.sniff, hijack)?);
+    let fakeip = cfg.fakeip_enabled();
+    let router = Arc::new(build_router(
+        entries,
+        cfg.sniff,
+        hijack,
+        fakeip,
+        cfg.dns.fakeip_range.as_deref(),
+        cfg.dns.fakeip6_range.as_deref(),
+        &cfg.dns.fakeip_filter,
+        cfg.dns.fakeip_filter_mode == "whitelist",
+        Path::new("."),
+    )?);
     if cfg.dns_enabled() {
         crate::dns::init_engine(&cfg)?;
     }
