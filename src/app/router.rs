@@ -6,7 +6,7 @@ use crate::dns::FakeIpPool;
 use crate::ruleset::RuleSet;
 use anyhow::Result;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,17 +152,7 @@ fn outbound_to(k: &OutboundKind) -> Outbound {
     }
 }
 
-pub fn build_router(
-    entries: Vec<RouteEntry>,
-    sniff: bool,
-    hijack_dns: bool,
-    fakeip: bool,
-    fakeip_range: Option<&str>,
-    fakeip6_range: Option<&str>,
-    fakeip_filter_paths: &[String],
-    fakeip_whitelist: bool,
-    config_dir: &Path,
-) -> Result<Router> {
+pub fn build_router(cfg: &crate::config::Config, entries: Vec<RouteEntry>) -> Result<Router> {
     let mut rulesets = Vec::with_capacity(entries.len());
     for e in &entries {
         match e {
@@ -183,16 +173,20 @@ pub fn build_router(
         }
     }
 
+    let fakeip = cfg.fakeip_enabled();
     let fakeip_pool = if fakeip {
-        Some(FakeIpPool::new(fakeip_range, fakeip6_range)?)
+        Some(FakeIpPool::new(
+            cfg.dns.fakeip_range.as_deref(),
+            cfg.dns.fakeip6_range.as_deref(),
+        )?)
     } else {
         None
     };
 
     let mut fakeip_filters = Vec::new();
     if fakeip {
-        for p in fakeip_filter_paths {
-            let path = resolve_path(config_dir, p);
+        for p in &cfg.dns.fakeip_filter {
+            let path = PathBuf::from(p);
             let name = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -215,20 +209,11 @@ pub fn build_router(
 
     Ok(Router {
         rules: entries.into_iter().zip(rulesets).collect(),
-        sniff,
-        hijack_dns,
+        sniff: cfg.sniff,
+        hijack_dns: cfg.dns_route_hijack(),
         fakeip,
         fakeip_pool,
         fakeip_filters,
-        fakeip_whitelist,
+        fakeip_whitelist: cfg.dns.fakeip_filter_mode == "whitelist",
     })
-}
-
-fn resolve_path(base: &Path, p: &str) -> PathBuf {
-    let path = PathBuf::from(p);
-    if path.is_absolute() {
-        path
-    } else {
-        base.join(path)
-    }
 }
