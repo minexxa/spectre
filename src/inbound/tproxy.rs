@@ -122,17 +122,18 @@ async fn handle_tproxy_tcp(
 
     let target = Target::Addr(dest);
 
-    // sniff
+    // sniff (domain + optional DNS detect for route-hijack)
     let mut head = [0u8; 1024];
     let n = stream.peek(&mut head).await.unwrap_or(0);
-    let sniff = if n > 0 && router.sniff_enabled() {
-        sniffer::sniff_tcp_ex(&head[..n], true, true)
+    let want_dns = router.hijack_dns();
+    let sniff = if n > 0 && (router.sniff_enabled() || want_dns) {
+        sniffer::sniff_tcp_ex(&head[..n], router.sniff_enabled(), want_dns)
     } else {
         sniffer::SniffResult::default()
     };
 
-    // DNS hijack
-    if sniff.dns || dest.port() == 53 {
+    // DNS route-hijack
+    if router.hijack_dns() && (dest.port() == 53 || sniff.dns) {
         return hijack_dns_tcp(&mut stream, router).await;
     }
 
@@ -173,35 +174,23 @@ async fn handle_tproxy_tcp(
 }
 
 async fn hijack_dns_tcp(stream: &mut TcpStream, router: Arc<Router>) -> Result<()> {
-    // length-prefixed DNS over TCP → answer via router DNS decision is
-    // handled by the dedicated DNS module; here we just close or forward
-    // minimally. Full hijack requires the DNS module to be running.
-    let _ = router;
-    let mut len_buf = [0u8; 2];
-    if stream.read_exact(&mut len_buf).await.is_err() {
-        return Ok(());
+    loop {
+        let mut len_buf = [0u8; 2];
+        match stream.read_exact(&mut len_buf).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > 65535 {
+            bail!("bad dns tcp length {len}");
+        }
+        let mut query = vec![0u8; len];
+        stream.read_exact(&mut query).await?;
+        let resp = crate::dns::answer_query(&query, &router).await?;
+        stream.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+        stream.write_all(&resp).await?;
     }
-    let len = u16::from_be_bytes(len_buf) as usize;
-    let mut q = vec![0u8; len];
-    if stream.read_exact(&mut q).await.is_err() {
-        return Ok(());
-    }
-    // empty NOERROR
-    let mut resp = q.clone();
-    if resp.len() >= 12 {
-        resp[2] |= 0x80;
-        resp[3] &= 0xf0;
-        resp[6] = 0;
-        resp[7] = 0;
-        resp[8] = 0;
-        resp[9] = 0;
-        resp[10] = 0;
-        resp[11] = 0;
-    }
-    let rlen = (resp.len() as u16).to_be_bytes();
-    stream.write_all(&rlen).await?;
-    stream.write_all(&resp).await?;
-    Ok(())
 }
 
 // ---------- UDP ----------
@@ -326,13 +315,21 @@ async fn handle_tproxy_udp_pkt(
     cfg: Arc<Config>,
     raw: Arc<RawSockets>,
 ) -> Result<()> {
-    let sniff = if router.sniff_enabled() {
-        sniffer::sniff_udp_ex(data, true, true)
+    let want_dns = router.hijack_dns();
+    let sniff = if router.sniff_enabled() || want_dns {
+        sniffer::sniff_udp_ex(data, router.sniff_enabled(), want_dns)
     } else {
         sniffer::SniffResult::default()
     };
-    if sniff.dns || dst.port() == 53 {
-        debug!("tproxy udp dns {src} -> {dst}");
+    if router.hijack_dns() && (dst.port() == 53 || sniff.dns) {
+        match crate::dns::answer_query(data, &router).await {
+            Ok(resp) => {
+                if let Err(e) = sendto_with_src(&raw, &resp, src, dst) {
+                    debug!("hijack dns reply: {e}");
+                }
+            }
+            Err(e) => debug!("hijack dns query: {e:#}"),
+        }
         return Ok(());
     }
     let decision = if let Some(ref d) = sniff.domain {
