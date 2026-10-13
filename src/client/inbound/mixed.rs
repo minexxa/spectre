@@ -1,8 +1,8 @@
 //! Mixed inbound: HTTP CONNECT + SOCKS4/4a/5 on one port (TCP + UDP ASSOCIATE).
 
-use crate::client::router::{Outbound, Router};
-use crate::client::sniffer;
-use crate::client::sockopt;
+use crate::client::app::router::{Outbound, Router};
+use crate::client::app::sniffer;
+use crate::client::app::sockopt;
 use crate::config::Config;
 use crate::client::inbound::target::Target;
 use crate::protocol::Address;

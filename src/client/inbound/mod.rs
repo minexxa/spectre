@@ -8,7 +8,7 @@ pub use target::Target;
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub mod tproxy {
-    use crate::client::router::Router;
+    use crate::client::app::router::Router;
     use crate::config::Config;
     use anyhow::{bail, Result};
     use std::sync::Arc;

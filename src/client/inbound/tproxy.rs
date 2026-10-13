@@ -6,9 +6,9 @@
 //! Behaviour aligned with ant: TCP peek+sniff+dns-hijack; UDP NAT sessions
 //! keyed by (peer, dest) with long-lived workers and raw IP reply packets.
 
-use crate::client::router::{Outbound, Router};
-use crate::client::sniffer;
-use crate::client::sockopt;
+use crate::client::app::router::{Outbound, Router};
+use crate::client::app::sniffer;
+use crate::client::app::sockopt;
 use crate::config::Config;
 use crate::client::inbound::target::Target;
 use crate::protocol::Address;

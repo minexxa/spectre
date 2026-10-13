@@ -1,6 +1,6 @@
 //! Unified target address representation + fake-ip aware dial helpers.
 
-use crate::client::router::Router;
+use crate::client::app::router::Router;
 use anyhow::{Context, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
