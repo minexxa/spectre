@@ -4,8 +4,6 @@ pub mod brutal;
 pub mod relay;
 pub mod udp;
 
-//! Spectre wire protocol definitions and helpers.
-
 use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 
