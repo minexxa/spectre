@@ -109,6 +109,55 @@ impl Router {
         }
     }
 
+    /// ant-style combined match (`match_route_ex` semantics for RULE-SET/MATCH):
+    /// rules are tried in order and **each** RULE-SET entry may hit via the
+    /// domain *or* the destination IP. A known (sniffed) domain therefore does
+    /// not bypass IP rulesets — e.g. `direct,cn-ip.ars` + `match,proxy` still
+    /// sends SNI'd traffic to a CN IP through Direct.
+    ///
+    /// Fake-IP destinations never hit IP rulesets: they route by the mapped
+    /// domain instead (ant: `dst_ip.filter(|a| domain_for_fakeip(a).is_none())`).
+    pub fn match_route(&self, domain: Option<&str>, ip: Option<IpAddr>) -> RouteMatch {
+        let mapped = ip.and_then(|a| self.domain_for_fakeip(a));
+        // Fake-IP must not match ip rulesets; the mapped domain is used below.
+        let ip_rule = if mapped.is_some() { None } else { ip };
+        let domain = domain.map(|s| s.to_string()).or(mapped);
+        for (entry, rs) in &self.rules {
+            match entry {
+                RouteEntry::RuleSet { outbound, path } => {
+                    if let Some(set) = rs {
+                        if let Some(d) = domain.as_deref() {
+                            if set.match_domain(d) {
+                                return RouteMatch {
+                                    outbound: outbound_to(outbound),
+                                    rule: path.display().to_string(),
+                                };
+                            }
+                        }
+                        if let Some(addr) = ip_rule {
+                            if set.match_ip(addr) {
+                                return RouteMatch {
+                                    outbound: outbound_to(outbound),
+                                    rule: path.display().to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
+                RouteEntry::Match(ob) => {
+                    return RouteMatch {
+                        outbound: outbound_to(ob),
+                        rule: "MATCH".into(),
+                    };
+                }
+            }
+        }
+        RouteMatch {
+            outbound: Outbound::Proxy,
+            rule: "MATCH".into(),
+        }
+    }
+
     pub fn match_ip(&self, ip: IpAddr) -> RouteMatch {
         // Fake-IP → route by original domain
         if let Some(domain) = self.domain_for_fakeip(ip) {
