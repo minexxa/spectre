@@ -48,4 +48,9 @@ dns:
 route:
   - direct,./rules/cn-ip.ars
   - direct,./rules/cn-domain.ars
+  # block/reject: drop the connection. Domains routed here answer DNS with
+  # NOERROR empty (rcode://success) — same as ant's rule-follow-route + block.
+  #   - block,./rules/ads.ars
+  # The final MATCH may also be block (reject everything not matched above).
+  #   - block
   - proxy
