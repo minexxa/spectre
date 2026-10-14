@@ -125,6 +125,9 @@ impl FakeIpPool {
             }
             by_ip.insert(IpAddr::V4(ip), domain.to_string());
             map.insert(domain.to_string(), ip);
+            drop(by_ip);
+            drop(map);
+            drop(next);
             debug!("fakeip {domain} A -> {ip}");
             return Some(ip);
         }
@@ -153,6 +156,9 @@ impl FakeIpPool {
             }
             by_ip.insert(IpAddr::V6(ip), domain.to_string());
             map.insert(domain.to_string(), ip);
+            drop(by_ip);
+            drop(map);
+            drop(next);
             debug!("fakeip {domain} AAAA -> {ip}");
             return Some(ip);
         }

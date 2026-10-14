@@ -1,9 +1,16 @@
 //! DNS upstream: udp / tcp / tls (DoT) / https (DoH).
 //! Clash-rs style URL: no scheme → UDP; udp:// tcp:// tls:// https://
+//!
+//! Aligned with ant:
+//! - DoT/DoH hosts configured as domains are resolved lazily at exchange time
+//!   (zero network IO at startup), bootstrap nameserver first, system resolver
+//!   as fallback; the result is cached and invalidated on exchange failure so
+//!   a changed address is picked up on the next query.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -185,9 +192,16 @@ pub async fn exchange(upstream: &DnsUpstream, query: &[u8]) -> Result<Vec<u8>> {
         } => {
             let a = match addr {
                 Some(a) => *a,
-                None => lookup_host_async(host, *port).await?,
+                None => resolve_upstream_addr(host, *port).await?,
             };
-            exchange_dot(a, sni, query).await
+            match exchange_dot(a, sni, query).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    // 地址可能已变：清缓存，下次查询重新解析。
+                    invalidate_upstream_addr(host, *port);
+                    Err(e)
+                }
+            }
         }
         DnsUpstream::Doh {
             host,
@@ -198,23 +212,80 @@ pub async fn exchange(upstream: &DnsUpstream, query: &[u8]) -> Result<Vec<u8>> {
         } => {
             let a = match addr {
                 Some(a) => *a,
-                None => lookup_host_async(host, *port).await?,
+                None => resolve_upstream_addr(host, *port).await?,
             };
-            exchange_doh(host, path, sni, a, query).await
+            match exchange_doh(host, path, sni, a, query).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    invalidate_upstream_addr(host, *port);
+                    Err(e)
+                }
+            }
         }
     }
 }
 
-async fn lookup_host_async(host: &str, port: u16) -> Result<SocketAddr> {
+// ── 惰性地址解析（对齐 ant：启动零网络 IO，用到处才解析，失败不致命）──────
+
+/// bootstrap 上游（纯 IP 的 udp/tcp），引擎初始化时由 `direct-nameserver`
+/// 注册（纯内存，不联网）。
+static BOOTSTRAP: OnceLock<DnsUpstream> = OnceLock::new();
+
+pub fn set_bootstrap(up: DnsUpstream) {
+    let _ = BOOTSTRAP.set(up);
+}
+
+/// DoT/DoH 域名 → 地址的解析缓存。交换失败时由 `exchange` 清除以触发重解。
+static RESOLVED_CACHE: LazyLock<Mutex<HashMap<String, SocketAddr>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn resolve_upstream_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let key = format!("{host}:{port}");
+    if let Some(a) = RESOLVED_CACHE.lock().unwrap().get(&key) {
+        return Ok(*a);
+    }
+    let addr = resolve_host_via_bootstrap(host, port)
+        .await
+        .with_context(|| format!("resolve dns upstream host {host}"))?;
+    RESOLVED_CACHE
+        .lock()
+        .unwrap()
+        .insert(key, addr);
+    Ok(addr)
+}
+
+fn invalidate_upstream_addr(host: &str, port: u16) {
+    RESOLVED_CACHE
+        .lock()
+        .unwrap()
+        .remove(&format!("{host}:{port}"));
+}
+
+/// 解析任意主机名：IP 直过 → bootstrap（default-nameserver）优先 → 系统解析回落。
+///
+/// bootstrap 优先可避免系统 DNS 指回 spectre 自身时的解析回环；bootstrap
+/// 失败仅影响当次解析，由调用方决定是否降级，绝不杀进程。
+pub async fn resolve_host_via_bootstrap(host: &str, port: u16) -> Result<SocketAddr> {
     let host = host.trim_matches(|c| c == '[' || c == ']');
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
+    if let Some(boot) = BOOTSTRAP.get() {
+        match lookup_via(boot, host, port).await {
+            Ok(a) => return Ok(a),
+            Err(e) => {
+                // Per-query; the queried name is user traffic — debug only.
+                tracing::debug!(
+                    "resolve {host} via bootstrap failed: {e:#}; falling back to system resolver"
+                );
+            }
+        }
+    }
     let mut it = tokio::net::lookup_host((host, port))
         .await
-        .with_context(|| format!("resolve dns upstream host {host}"))?;
+        .with_context(|| format!("resolve {host} via system resolver"))?;
     it.next()
-        .with_context(|| format!("no address for dns upstream host {host}"))
+        .with_context(|| format!("no address for {host}"))
 }
 
 async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
@@ -380,4 +451,86 @@ fn tls_connector_doh() -> TlsConnector {
         TlsConnector::from(Arc::new(cfg))
     });
     CONNECTOR.clone()
+}
+
+/// Resolve `host` to an address using the bootstrap nameserver (A query).
+/// IP literals are returned as-is.
+async fn lookup_via(bootstrap: &DnsUpstream, host: &str, port: u16) -> Result<SocketAddr> {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let query = build_a_query(host);
+    // bootstrap 只可能是 Udp/Tcp（引擎仅注册纯 IP 的 udp/tcp 上游）。这里直接走
+    // 非惰性交换路径，避免 exchange → resolve → lookup_via 的 async 递归。
+    let resp = match bootstrap {
+        DnsUpstream::Udp(a) => exchange_udp(*a, &query).await,
+        DnsUpstream::Tcp(a) => exchange_tcp(*a, &query).await,
+        _ => bail!("bootstrap must be a pure-IP udp/tcp upstream"),
+    }
+    .context("bootstrap lookup")?;
+    let ip = first_a(&resp)
+        .with_context(|| format!("no A record for {host} via bootstrap"))?;
+    Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+}
+
+fn build_a_query(host: &str) -> Vec<u8> {
+    let mut q = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    for label in host.trim_end_matches('.').split('.') {
+        let b = label.as_bytes();
+        q.push(b.len() as u8);
+        q.extend_from_slice(b);
+    }
+    q.push(0);
+    q.extend_from_slice(&1u16.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes());
+    q
+}
+
+fn first_a(msg: &[u8]) -> Option<std::net::Ipv4Addr> {
+    if msg.len() < 12 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    let mut i = 12usize;
+    for _ in 0..qd {
+        i = skip_name(msg, i)?;
+        i += 4;
+    }
+    for _ in 0..an {
+        i = skip_name(msg, i)?;
+        if i + 10 > msg.len() {
+            return None;
+        }
+        let typ = u16::from_be_bytes([msg[i], msg[i + 1]]);
+        let rdlen = u16::from_be_bytes([msg[i + 8], msg[i + 9]]) as usize;
+        let rdata = i + 10;
+        if typ == 1 && rdlen == 4 && rdata + 4 <= msg.len() {
+            return Some(std::net::Ipv4Addr::new(
+                msg[rdata],
+                msg[rdata + 1],
+                msg[rdata + 2],
+                msg[rdata + 3],
+            ));
+        }
+        i = rdata + rdlen;
+    }
+    None
+}
+
+fn skip_name(msg: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        if i >= msg.len() {
+            return None;
+        }
+        let len = msg[i] as usize;
+        if len == 0 {
+            return Some(i + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            return (i + 2 <= msg.len()).then_some(i + 2);
+        }
+        i += 1 + len;
+    }
 }
