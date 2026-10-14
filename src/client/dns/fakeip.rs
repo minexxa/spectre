@@ -3,6 +3,8 @@
 //! Blacklist mode: every domain gets a fake address unless it hits an exclude
 //! ruleset (then real DNS). Whitelist mode: only domains hitting a filter
 //! ruleset get fake addresses.
+//!
+//! Mapping is in-memory only (spectre has no redb AppCache like ant).
 
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -55,28 +57,27 @@ impl FakeIpPool {
     pub fn has_v4(&self) -> bool {
         self.v4.is_some()
     }
+
     pub fn has_v6(&self) -> bool {
         self.v6.is_some()
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v) => self
-                .v4
-                .as_ref()
-                .map(|r| {
-                    let n = u32::from(v);
-                    n >= r.start && n <= r.end
-                })
-                .unwrap_or(false),
-            IpAddr::V6(v) => self
-                .v6
-                .as_ref()
-                .map(|r| {
-                    let n = u128::from(v);
-                    n >= r.start && n <= r.end
-                })
-                .unwrap_or(false),
+        match &ip {
+            IpAddr::V4(v4) => {
+                let Some(r) = &self.v4 else {
+                    return false;
+                };
+                let n = u32::from(*v4);
+                n >= r.start && n <= r.end
+            }
+            IpAddr::V6(v6) => {
+                let Some(r) = &self.v6 else {
+                    return false;
+                };
+                let n = u128::from(*v6);
+                n >= r.start && n <= r.end
+            }
         }
     }
 
@@ -84,74 +85,79 @@ impl FakeIpPool {
         self.by_ip.lock().ok()?.get(&ip).cloned()
     }
 
+    /// Allocate (or reuse) a fake address for `domain`. `v6` selects family.
     pub fn allocate(&self, domain: &str, v6: bool) -> Option<IpAddr> {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         if domain.is_empty() {
             return None;
         }
         if v6 {
-            let range = self.v6.as_ref()?;
-            if let Some(ip) = self.by_domain6.lock().ok()?.get(&domain).copied() {
-                return Some(IpAddr::V6(ip));
-            }
-            let ip = next_v6(range)?;
-            if let Ok(mut m) = self.by_domain6.lock() {
-                m.insert(domain.clone(), ip);
-            }
-            if let Ok(mut m) = self.by_ip.lock() {
-                m.insert(IpAddr::V6(ip), domain.clone());
-            }
-            debug!("fakeip {domain} AAAA -> {ip}");
+            let ip = self.alloc6(&domain)?;
             Some(IpAddr::V6(ip))
         } else {
-            let range = self.v4.as_ref()?;
-            if let Some(ip) = self.by_domain4.lock().ok()?.get(&domain).copied() {
-                return Some(IpAddr::V4(ip));
-            }
-            let ip = next_v4(range)?;
-            if let Ok(mut m) = self.by_domain4.lock() {
-                m.insert(domain.clone(), ip);
-            }
-            if let Ok(mut m) = self.by_ip.lock() {
-                m.insert(IpAddr::V4(ip), domain.clone());
-            }
-            debug!("fakeip {domain} A -> {ip}");
+            let ip = self.alloc4(&domain)?;
             Some(IpAddr::V4(ip))
         }
     }
-}
 
-fn next_v4(r: &V4Range) -> Option<Ipv4Addr> {
-    let mut n = r.next.lock().ok()?;
-    // skip network / broadcast-ish ends by only using [start+1, end)
-    if *n < r.start + 1 {
-        *n = r.start + 1;
+    fn alloc4(&self, domain: &str) -> Option<Ipv4Addr> {
+        let range = self.v4.as_ref()?;
+        let mut map = self.by_domain4.lock().ok()?;
+        if let Some(ip) = map.get(domain) {
+            return Some(*ip);
+        }
+        let mut next = range.next.lock().ok()?;
+        let span = range.end.saturating_sub(range.start).saturating_add(1);
+        if span == 0 {
+            return None;
+        }
+        for _ in 0..span {
+            let n = *next;
+            *next = if n >= range.end {
+                range.start
+            } else {
+                n + 1
+            };
+            let ip = Ipv4Addr::from(n);
+            let mut by_ip = self.by_ip.lock().ok()?;
+            if by_ip.contains_key(&IpAddr::V4(ip)) {
+                continue;
+            }
+            by_ip.insert(IpAddr::V4(ip), domain.to_string());
+            map.insert(domain.to_string(), ip);
+            debug!("fakeip {domain} A -> {ip}");
+            return Some(ip);
+        }
+        None
     }
-    if *n >= r.end {
-        *n = r.start + 1;
-    }
-    let ip = Ipv4Addr::from(*n);
-    *n = n.wrapping_add(1);
-    if *n >= r.end {
-        *n = r.start + 1;
-    }
-    Some(ip)
-}
 
-fn next_v6(r: &V6Range) -> Option<Ipv6Addr> {
-    let mut n = r.next.lock().ok()?;
-    if *n < r.start + 1 {
-        *n = r.start + 1;
+    fn alloc6(&self, domain: &str) -> Option<Ipv6Addr> {
+        let range = self.v6.as_ref()?;
+        let mut map = self.by_domain6.lock().ok()?;
+        if let Some(ip) = map.get(domain) {
+            return Some(*ip);
+        }
+        let mut next = range.next.lock().ok()?;
+        // Don't scan the whole /18; try a bounded number of collisions (same as ant).
+        for _ in 0..4096 {
+            let n = *next;
+            *next = if n >= range.end {
+                range.start
+            } else {
+                n + 1
+            };
+            let ip = Ipv6Addr::from(n);
+            let mut by_ip = self.by_ip.lock().ok()?;
+            if by_ip.contains_key(&IpAddr::V6(ip)) {
+                continue;
+            }
+            by_ip.insert(IpAddr::V6(ip), domain.to_string());
+            map.insert(domain.to_string(), ip);
+            debug!("fakeip {domain} AAAA -> {ip}");
+            return Some(ip);
+        }
+        None
     }
-    if *n >= r.end {
-        *n = r.start + 1;
-    }
-    let ip = Ipv6Addr::from(*n);
-    *n = n.wrapping_add(1);
-    if *n >= r.end {
-        *n = r.start + 1;
-    }
-    Some(ip)
 }
 
 fn parse_v4(s: &str) -> Result<V4Range> {
@@ -159,17 +165,34 @@ fn parse_v4(s: &str) -> Result<V4Range> {
     let IpAddr::V4(v4) = ip else {
         bail!("fakeip-range must be IPv4 CIDR, got {s}");
     };
-    let host_bits = 32u32.saturating_sub(prefix as u32);
-    if host_bits == 0 {
-        bail!("fakeip-range too small: {s}");
+    if prefix > 32 {
+        bail!("fakeip-range prefix out of range: {s}");
     }
-    let mask = !((1u32 << host_bits) - 1);
-    let start = u32::from(v4) & mask;
-    let end = start + (1u32 << host_bits) - 1;
+    let host_bits = 32u32.saturating_sub(prefix as u32);
+    let mask = if host_bits >= 32 {
+        0u32
+    } else {
+        !((1u32 << host_bits) - 1)
+    };
+    let network = u32::from(v4) & mask;
+    let broadcast = if host_bits >= 32 {
+        u32::MAX
+    } else {
+        network | ((1u32 << host_bits) - 1)
+    };
+    // Skip network/broadcast when the range is large enough (aligned with ant/ipnet).
+    let (start, end) = if prefix <= 30 {
+        (network + 1, broadcast - 1)
+    } else {
+        (network, broadcast)
+    };
+    if start > end {
+        bail!("fakeip-range {s} has no usable address");
+    }
     Ok(V4Range {
         start,
         end,
-        next: Mutex::new(start + 1),
+        next: Mutex::new(start),
     })
 }
 
@@ -178,28 +201,31 @@ fn parse_v6(s: &str) -> Result<V6Range> {
     let IpAddr::V6(v6) = ip else {
         bail!("fakeip6-range must be IPv6 CIDR, got {s}");
     };
-    let host_bits = 128u32.saturating_sub(prefix as u32);
-    if host_bits == 0 || host_bits > 64 {
-        // Cap practical size; still accept /64..
-        if host_bits == 0 {
-            bail!("fakeip6-range too small: {s}");
-        }
+    if prefix > 128 {
+        bail!("fakeip6-range prefix out of range: {s}");
     }
+    let host_bits = 128u32.saturating_sub(prefix as u32);
     let mask = if host_bits >= 128 {
         0u128
     } else {
         !((1u128 << host_bits) - 1)
     };
-    let start = u128::from(v6) & mask;
-    let end = if host_bits >= 128 {
+    let network = u128::from(v6) & mask;
+    let broadcast = if host_bits >= 128 {
         u128::MAX
     } else {
-        start + (1u128 << host_bits) - 1
+        network | ((1u128 << host_bits) - 1)
     };
+    // ant: start = network + 1, end = broadcast
+    let start = network.saturating_add(1);
+    let end = broadcast;
+    if start > end {
+        bail!("fakeip6-range {s} has no usable address");
+    }
     Ok(V6Range {
         start,
         end,
-        next: Mutex::new(start + 1),
+        next: Mutex::new(start),
     })
 }
 
@@ -207,7 +233,9 @@ fn parse_cidr(s: &str) -> Result<(IpAddr, u8)> {
     let (addr, pref) = s
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("CIDR expected host/prefix, got `{s}`"))?;
-    let ip: IpAddr = addr.parse().map_err(|e| anyhow::anyhow!("bad IP in `{s}`: {e}"))?;
+    let ip: IpAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad IP in `{s}`: {e}"))?;
     let prefix: u8 = pref
         .parse()
         .map_err(|e| anyhow::anyhow!("bad prefix in `{s}`: {e}"))?;
@@ -221,30 +249,29 @@ fn parse_cidr(s: &str) -> Result<(IpAddr, u8)> {
     Ok((ip, prefix))
 }
 
-/// Build a minimal DNS response with one A or AAAA answer.
+/// Build a minimal DNS response with one A or AAAA answer (flags aligned with ant).
 pub fn build_fakeip_answer(query: &[u8], ip: IpAddr) -> Vec<u8> {
-    // Keep question section, set QR/AA, one answer RR.
-    let mut resp = query.to_vec();
-    if resp.len() < 12 {
-        resp.resize(12, 0);
+    let question_end = question_end(query).unwrap_or(12);
+    let mut resp = Vec::with_capacity(question_end + 28);
+    // ID
+    if query.len() >= 2 {
+        resp.extend_from_slice(&query[..2]);
+    } else {
+        resp.extend_from_slice(&[0, 0]);
     }
-    // QR=1, AA=1, RCODE=0
-    resp[2] = 0x84;
-    resp[3] = 0x00;
-    // ANCOUNT = 1
-    resp[6] = 0;
-    resp[7] = 1;
-    resp[8] = 0;
-    resp[9] = 0;
-    resp[10] = 0;
-    resp[11] = 0;
-
-    // Truncate to end of question
-    let q_end = question_end(query).unwrap_or(query.len().min(512));
-    resp.truncate(q_end);
-
-    // Answer: pointer to qname at offset 12, type, class IN, TTL 1, RDATA
-    resp.extend_from_slice(&[0xc0, 0x0c]); // name pointer
+    // Flags: QR=1, RD=1, RA=1 (same as ant)
+    resp.push(0x81);
+    resp.push(0x80);
+    // QDCOUNT=1, ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    if question_end > 12 && query.len() >= question_end {
+        resp.extend_from_slice(&query[12..question_end]);
+    }
+    // Answer: pointer to qname at offset 12
+    resp.extend_from_slice(&[0xC0, 0x0C]);
     match ip {
         IpAddr::V4(v4) => {
             resp.extend_from_slice(&1u16.to_be_bytes()); // A
