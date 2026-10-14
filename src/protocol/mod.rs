@@ -2,6 +2,7 @@
 
 pub mod brutal;
 pub mod obfs;
+pub mod obfs_socket;
 pub mod relay;
 pub mod udp;
 
