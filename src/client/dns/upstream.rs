@@ -227,12 +227,14 @@ pub async fn exchange(upstream: &DnsUpstream, query: &[u8]) -> Result<Vec<u8>> {
 
 // ── 惰性地址解析（对齐 ant：启动零网络 IO，用到处才解析，失败不致命）──────
 
-/// bootstrap 上游（纯 IP 的 udp/tcp），引擎初始化时由 `direct-nameserver`
-/// 注册（纯内存，不联网）。
+/// bootstrap 上游（纯 IP 的 udp/tcp），由 `default-nameserver`（或
+/// `direct-nameserver` 兜底）注册。纯内存注册，不联网。
 static BOOTSTRAP: OnceLock<DnsUpstream> = OnceLock::new();
 
-pub fn set_bootstrap(up: DnsUpstream) {
-    let _ = BOOTSTRAP.set(up);
+/// Register the bootstrap upstream. Returns true when this call won the race
+/// (first registration wins; later calls are no-ops).
+pub fn set_bootstrap(up: DnsUpstream) -> bool {
+    BOOTSTRAP.set(up).is_ok()
 }
 
 /// DoT/DoH 域名 → 地址的解析缓存。交换失败时由 `exchange` 清除以触发重解。

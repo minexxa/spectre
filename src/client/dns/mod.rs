@@ -46,19 +46,11 @@ impl DnsEngine {
             .as_ref()
             .map(|s| parse_nameserver(s))
             .transpose()?;
-        // Bootstrap upstream for lazy DoT/DoH (and dial-time) host resolution:
-        // only a pure-IP udp/tcp nameserver qualifies (ant: default-nameserver).
-        // Registration is memory-only — no network IO at startup, and a
-        // bootstrap failure only affects the single lookup that used it.
-        match &direct_ns {
-            Some(ns @ (DnsUpstream::Udp(_) | DnsUpstream::Tcp(_))) => {
-                set_bootstrap(ns.clone());
-                debug!("dns bootstrap upstream {ns}");
-            }
-            _ => {
-                debug!("dns bootstrap unset (direct-nameserver is not pure-IP udp/tcp)");
-            }
-        }
+        // Bootstrap upstream for lazy host resolution (DoT/DoH upstream
+        // domains + proxy node domains). No-op if already registered at
+        // client startup. Memory-only — no network IO here, and a bootstrap
+        // failure only affects the single lookup that used it.
+        register_bootstrap(cfg);
         let cache = if cfg.dns.cache_size > 0 {
             Some(Arc::new(DnsCache::new(cfg.dns.cache_size)))
         } else {
@@ -69,6 +61,52 @@ impl DnsEngine {
             proxy_ns,
             cache,
         })
+    }
+}
+
+/// Register the bootstrap upstream used for lazy host resolution.
+///
+/// Priority (ant parity): `dns.default-nameserver` first; when unset, fall
+/// back to `dns.direct-nameserver` if it is a pure-IP udp/tcp upstream.
+/// Idempotent — the first registration wins.
+pub fn register_bootstrap(cfg: &Config) {
+    if let Some(ns) = cfg
+        .dns
+        .default_nameserver
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match parse_nameserver(ns) {
+            Ok(up @ (DnsUpstream::Udp(_) | DnsUpstream::Tcp(_))) => {
+                if set_bootstrap(up.clone()) {
+                    debug!("dns bootstrap upstream {up} (default-nameserver)");
+                }
+                return;
+            }
+            Ok(_) => {
+                // DoT/DoH bootstrap would itself need resolution (chicken-and-egg).
+                warn!("default-nameserver must be a udp/tcp nameserver (got `{ns}`); ignored");
+            }
+            Err(e) => {
+                // validate() rejects bad values at load; keep this defensive.
+                warn!("default-nameserver ignored: {e:#}");
+            }
+        }
+    }
+    // Fallback: direct-nameserver when it is a pure-IP udp/tcp upstream.
+    if let Some(s) = cfg.dns.direct_nameserver.as_deref() {
+        match parse_nameserver(s) {
+            Ok(up @ (DnsUpstream::Udp(_) | DnsUpstream::Tcp(_))) => {
+                if set_bootstrap(up.clone()) {
+                    debug!("dns bootstrap upstream {up} (direct-nameserver fallback)");
+                }
+            }
+            Ok(_) => {
+                debug!("dns bootstrap unset (direct-nameserver is not pure-IP udp/tcp)");
+            }
+            Err(e) => warn!("direct-nameserver: {e:#}"),
+        }
     }
 }
 
