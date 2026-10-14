@@ -178,7 +178,8 @@ async fn answer_with(eng: &DnsEngine, query: &[u8], router: &Router) -> Result<V
     }
 
     // DNS routing: domain → route match → Direct/Proxy nameserver, with
-    // fallback to the other side when the preferred one is unset.
+    // fallback to the other side when the preferred one is unset. Fake-IP is
+    // decided above; only domains that fall through to DNS routing see this.
     let upstream = match router.dns_outbound_for_domain(&domain) {
         Outbound::Direct => eng.direct_ns.as_ref().or_else(|| {
             warn!("dns {domain}: route=direct but direct-nameserver unset, falling back");
@@ -188,6 +189,12 @@ async fn answer_with(eng: &DnsEngine, query: &[u8], router: &Router) -> Result<V
             warn!("dns {domain}: route=proxy but proxy-nameserver unset, falling back");
             eng.direct_ns.as_ref()
         }),
+        Outbound::Block => {
+            // Domain routed to block/reject: answer like ant's `rcode://success`
+            // upstream under `rule-follow-route: true` — NOERROR, no records.
+            debug!("dns {domain} -> block (rcode://success)");
+            return Ok(make_noerror_empty(query));
+        }
     };
 
     let upstream = match upstream {
