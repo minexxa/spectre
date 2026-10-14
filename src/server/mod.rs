@@ -26,6 +26,11 @@ pub struct ServerConfigYaml {
     pub username: Option<String>,
     pub upstream: Option<String>,
     pub server_name: Option<String>,
+    /// Must match the client's `obfs_psk` exactly, or clients using
+    /// obfuscation won't be understood. See `client::ClientConfigYaml::obfs_psk`
+    /// and `protocol::obfs_socket` (unverified against a real compiler — see
+    /// that module's doc comment before enabling in production).
+    pub obfs_psk: Option<Vec<u8>>,
 }
 
 pub async fn run_server(cfg: ServerConfigYaml) -> Result<()> {
@@ -73,7 +78,15 @@ pub async fn run_server(cfg: ServerConfigYaml) -> Result<()> {
     let base_config = Arc::new(server_config);
 
     let socket = bind_udp(cfg.listen).context("bind udp socket")?;
-    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
+    let base_runtime =
+        quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
+    let runtime: Arc<dyn quinn::Runtime> = match &cfg.obfs_psk {
+        Some(psk) => Arc::new(crate::protocol::obfs_socket::ObfsRuntime::new(
+            base_runtime,
+            psk.clone(),
+        )),
+        None => base_runtime,
+    };
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some((*base_config).clone()),
