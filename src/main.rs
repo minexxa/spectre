@@ -119,6 +119,9 @@ async fn run_proxy(config_path: &Path) -> Result<()> {
                 username: Some(cfg.username().to_string()),
                 upstream: Some(cfg.upstream().to_string()),
                 server_name: Some(cfg.server_name().to_string()),
+                // TODO: wire to a `obfs-psk` YAML field once config.rs grows
+                // one; see `protocol::obfs_socket` doc comment.
+                obfs_psk: None,
             };
             spectre::server::run_server(server_cfg).await?;
         }
