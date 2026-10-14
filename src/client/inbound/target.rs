@@ -1,7 +1,7 @@
 //! Unified target address representation + fake-ip aware dial helpers.
 
 use crate::client::app::router::Router;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -50,12 +50,10 @@ pub async fn resolve_direct(
         .or_else(|| router.domain_for_fakeip(dest.ip()));
     if let Some(host) = domain {
         if host.parse::<IpAddr>().is_err() {
-            let mut addrs = tokio::net::lookup_host((host.as_str(), dest.port()))
-                .await
-                .with_context(|| format!("resolve {host}"))?;
-            if let Some(a) = addrs.next() {
-                return Ok(a);
-            }
+            // Bootstrap nameserver first (avoids resolution loops when the
+            // system DNS points back at spectre itself), system resolver as
+            // fallback — same strategy as the DNS upstream path.
+            return crate::client::dns::resolve_host_via_bootstrap(&host, dest.port()).await;
         }
     }
     Ok(dest)
