@@ -102,6 +102,14 @@ pub struct DnsConfig {
     #[serde(default, rename = "proxy-nameserver")]
     pub proxy_nameserver: Option<String>,
 
+    /// Bootstrap nameserver (ant: `default-nameserver`) used to resolve
+    /// proxy node domains and DoT/DoH upstream domains. Must be a pure-IP
+    /// udp/tcp nameserver — it resolves everything else, so it cannot itself
+    /// depend on any resolution. Optional: falls back to `direct-nameserver`
+    /// when that is a pure-IP udp/tcp upstream.
+    #[serde(default, rename = "default-nameserver")]
+    pub default_nameserver: Option<String>,
+
     #[serde(default = "default_cache_size", rename = "cache-size")]
     pub cache_size: usize,
 
@@ -217,6 +225,29 @@ impl Config {
                         bail!("fakeip-filter-mode=whitelist requires non-empty fakeip-filter");
                     }
                 }
+                // default-nameserver (bootstrap): must parse and be a pure IP —
+                // it resolves proxy node / DoT / DoH domains, so it cannot
+                // itself depend on any resolution (same rule as ant).
+                if let Some(ns) = self.dns.default_nameserver.as_deref() {
+                    let ns = ns.trim();
+                    if !ns.is_empty() {
+                        crate::client::dns::parse_nameserver(ns)
+                            .context("invalid default-nameserver")?;
+                        let host_part = ns.rsplit("://").next().unwrap_or(ns);
+                        let host_part = host_part.split('/').next().unwrap_or(host_part);
+                        let host = if let Some(end) = host_part.find(']') {
+                            &host_part[1..end]
+                        } else {
+                            host_part
+                                .rsplit_once(':')
+                                .map(|(h, _)| h)
+                                .unwrap_or(host_part)
+                        };
+                        if host.parse::<std::net::IpAddr>().is_err() {
+                            bail!("default-nameserver must be a pure IP address (got {host})");
+                        }
+                    }
+                }
                 // Resolve relative ARS paths against config file directory.
                 let base = config_path.parent().unwrap_or_else(|| Path::new("."));
                 for rule in &mut self.route {
@@ -253,7 +284,10 @@ impl Config {
         Ok(SocketAddr::new(ip, port))
     }
 
-    pub fn client_server(&self) -> Result<SocketAddr> {
+    /// Client-mode Spectre server address. `proxy.server` may be a domain:
+    /// it is resolved via the bootstrap nameserver (`default-nameserver`)
+    /// first, with the system resolver as fallback (ant parity).
+    pub async fn client_server(&self) -> Result<SocketAddr> {
         let host = self
             .proxy
             .server
@@ -263,13 +297,12 @@ impl Config {
         if port == 0 {
             bail!("proxy.port required in client mode");
         }
-        // host may be IPv6 without brackets
-        let s = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
-        s.parse().with_context(|| format!("parse proxy.server+port `{s}`"))
+        let host = host.trim();
+        // IP literal (v4, bare v6, or bracketed v6) — no resolution needed.
+        if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
+        crate::client::dns::resolve_host_via_bootstrap(host, port).await
     }
 
     /// Effective bind address after applying mode defaults.
