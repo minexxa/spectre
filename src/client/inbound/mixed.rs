@@ -650,15 +650,12 @@ async fn socks5_udp_relay(
                 let key2 = key.clone();
                 tokio::spawn(async move {
                     let mut rbuf = vec![0u8; 65535];
-                    loop {
-                        match tokio::time::timeout(UDP_IDLE, sock2.recv_from(&mut rbuf)).await {
-                            Ok(Ok((rn, src))) => {
-                                let reply = encode_socks5_udp_reply(&src, &rbuf[..rn]);
-                                if udp2.send_to(&reply, client).await.is_err() {
-                                    break;
-                                }
-                            }
-                            _ => break,
+                    while let Ok(Ok((rn, src))) =
+                        tokio::time::timeout(UDP_IDLE, sock2.recv_from(&mut rbuf)).await
+                    {
+                        let reply = encode_socks5_udp_reply(&src, &rbuf[..rn]);
+                        if udp2.send_to(&reply, client).await.is_err() {
+                            break;
                         }
                     }
                     sessions2.lock().await.remove(&key2);
@@ -677,27 +674,21 @@ async fn socks5_udp_relay(
                         let sessions2 = sessions.clone();
                         let key2 = key.clone();
                         tokio::spawn(async move {
-                            loop {
-                                match tokio::time::timeout(UDP_IDLE, rx.recv()).await {
-                                    Ok(Some((src_addr, data))) => {
-                                        let src = match format!(
-                                            "{}:{}",
-                                            src_addr.host, src_addr.port
-                                        )
-                                        .parse::<SocketAddr>()
-                                        {
-                                            Ok(a) => a,
-                                            Err(_) => SocketAddr::new(
-                                                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                                                src_addr.port,
-                                            ),
-                                        };
-                                        let reply = encode_socks5_udp_reply(&src, &data);
-                                        if udp2.send_to(&reply, client).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    _ => break,
+                            while let Ok(Some((src_addr, data))) =
+                                tokio::time::timeout(UDP_IDLE, rx.recv()).await
+                            {
+                                let src = match format!("{}:{}", src_addr.host, src_addr.port)
+                                    .parse::<SocketAddr>()
+                                {
+                                    Ok(a) => a,
+                                    Err(_) => SocketAddr::new(
+                                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                                        src_addr.port,
+                                    ),
+                                };
+                                let reply = encode_socks5_udp_reply(&src, &data);
+                                if udp2.send_to(&reply, client).await.is_err() {
+                                    break;
                                 }
                             }
                             sessions2.lock().await.remove(&key2);
