@@ -167,6 +167,10 @@ async fn handle_tproxy_tcp(
                 r = tokio::io::copy(&mut rr, &mut lw) => { let _ = r; }
             }
         }
+        Outbound::Block => {
+            debug!("tproxy tcp block {peer} -> {dest}");
+            return Ok(());
+        }
         Outbound::Proxy => {
             // Prefer domain (sniffed or fakeip reverse) so server resolves real host
             let host = domain.or_else(|| router.domain_for_fakeip(dest.ip()));
@@ -300,6 +304,13 @@ async fn udp_session_worker(
             .await
             .unwrap_or(dest);
             udp_direct_session(raw, peer, dest, real, first, rx).await
+        }
+        Outbound::Block => {
+            debug!("tproxy udp block {peer} -> {dest}");
+            // Keep the NAT entry alive but discard: later packets of this flow
+            // are dropped here (ant drains with an idle timeout, same effect).
+            while let Ok(Some(_)) = tokio::time::timeout(UDP_IDLE, rx.recv()).await {}
+            Ok(())
         }
         Outbound::Proxy => {
             let host = domain

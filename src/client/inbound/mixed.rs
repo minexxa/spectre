@@ -303,6 +303,10 @@ async fn http_absolute_proxy(
                 r = tokio::io::copy(&mut rr, &mut lw) => { let _ = r; }
             }
         }
+        Outbound::Block => {
+            debug!("mixed http block {}", target.display());
+            return Ok(());
+        }
         Outbound::Proxy => {
             // Use a buffer stream: write head+body after spectre connect via a helper
             crate::client::proxy_via_spectre_with_preface(local, &target, &cfg, &head, &body)
@@ -437,6 +441,10 @@ async fn dispatch_tcp(
                 r = tokio::io::copy(&mut lr, &mut rw) => { let _ = r; }
                 r = tokio::io::copy(&mut rr, &mut lw) => { let _ = r; }
             }
+        }
+        Outbound::Block => {
+            debug!("mixed block {}", target.display());
+            return Ok(());
         }
         Outbound::Proxy => {
             // Prefer domain over fake-ip for remote resolution
@@ -600,6 +608,10 @@ async fn socks5_udp_relay(
         );
 
         match decision.outbound {
+            Outbound::Block => {
+                debug!("socks5 udp block {client} -> {}", target.display());
+                continue;
+            }
             Outbound::Direct => {
                 let dst = match &target {
                     Target::Addr(a) => {
