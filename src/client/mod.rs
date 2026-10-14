@@ -65,7 +65,7 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
         password: cfg.password.clone(),
         rx_bps: cfg.rx_bps,
         tx_bps: cfg.tx_bps,
-        padding: random_padding(16..48),
+        padding: random_padding(AUTH_PADDING),
     };
     send.write_all(&auth.encode()).await?;
 
@@ -87,6 +87,7 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
         "Brutal: upload {} B/s, download {} B/s (0 = BBR)",
         cfg.tx_bps, cfg.rx_bps
     );
+    spawn_padding_keepalive(conn.clone());
 
     // TCP local proxy
     let listener = TcpListener::bind(cfg.listen).await?;
@@ -352,7 +353,7 @@ async fn handle_local(
     let addr = Address::new(req_local.host.clone(), req_local.port);
     let req = TcpConnectRequest {
         address: addr,
-        padding: random_padding(8..32),
+        padding: random_padding(TCP_REQUEST_PADDING),
     };
     send.write_all(&req.encode()).await?;
 
@@ -384,6 +385,42 @@ async fn handle_local(
         info!("relay ended: {e}");
     }
     Ok(())
+}
+
+/// Keep the connection busy with small, irregularly-sized, irregularly-timed
+/// padding streams instead of relying solely on QUIC's own PING keepalive.
+///
+/// A built-in QUIC keepalive fires at one fixed interval for the whole
+/// connection lifetime, which is a clean timing signature for passive flow
+/// classifiers (constant-size, constant-period packets on an otherwise idle
+/// connection are not how browser traffic behaves). Spawning our own
+/// `Command::Padding` frames on short-lived bidirectional streams, at a
+/// jittered interval and with a randomized length (see
+/// [`crate::protocol::KEEPALIVE_PADDING`]), gives idle periods a shape closer
+/// to ordinary HTTP/3 traffic (sporadic small requests) instead of a metronome.
+/// Each task exits quietly once the connection is gone.
+fn spawn_padding_keepalive(conn: quinn::Connection) {
+    tokio::spawn(async move {
+        use std::time::Duration;
+        // ~20s base, up to +50% jitter -> effectively 20-30s between frames.
+        // Close enough to a typical idle-HTTP3-connection PING interval to
+        // not look unusually chatty or unusually quiet.
+        let base = Duration::from_secs(20);
+        loop {
+            tokio::time::sleep(jittered_interval(base, 0.5)).await;
+            let Ok((mut send, mut recv)) = conn.open_bi().await else {
+                break; // connection closed
+            };
+            let frame = PaddingFrame::random();
+            if send.write_all(&frame.encode()).await.is_err() {
+                break;
+            }
+            let _ = send.finish();
+            // Drain whatever (if anything) comes back, then drop the stream.
+            let mut sink = [0u8; 64];
+            while matches!(recv.read(&mut sink).await, Ok(Some(n)) if n > 0) {}
+        }
+    });
 }
 
 fn configure_client(cfg: &ClientConfigYaml) -> Result<quinn::ClientConfig> {
@@ -535,13 +572,14 @@ async fn get_or_connect(cfg: &Config) -> Result<quinn::Connection> {
         password: cfg.password().to_string(),
         rx_bps: cfg.rx_bps()?,
         tx_bps: cfg.tx_bps()?,
-        padding: random_padding(16..48),
+        padding: random_padding(AUTH_PADDING),
     };
     send.write_all(&auth.encode()).await?;
     let mut buf = vec![0u8; 1024];
     let n = recv.read(&mut buf).await?.ok_or_else(|| anyhow!("no auth response"))?;
     let _ = n;
     info!("Spectre AUTH ok");
+    spawn_padding_keepalive(conn.clone());
     *guard = Some(conn.clone());
     Ok(conn)
 }
@@ -572,7 +610,7 @@ pub async fn proxy_via_spectre_with_preface(
     };
     let req = TcpConnectRequest {
         address: Address::new(host, port),
-        padding: random_padding(8..32),
+        padding: random_padding(TCP_REQUEST_PADDING),
     };
     send.write_all(&req.encode()).await?;
     let mut buf = vec![0u8; 1024];
