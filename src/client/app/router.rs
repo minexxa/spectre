@@ -13,6 +13,9 @@ use std::sync::Arc;
 pub enum Outbound {
     Direct,
     Proxy,
+    /// Reject the connection (ant `block`/`reject`); DNS answers NOERROR
+    /// empty (rcode://success) for domains routed here.
+    Block,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +201,7 @@ fn outbound_to(k: &OutboundKind) -> Outbound {
     match k {
         OutboundKind::Direct => Outbound::Direct,
         OutboundKind::Proxy => Outbound::Proxy,
+        OutboundKind::Block => Outbound::Block,
     }
 }
 
