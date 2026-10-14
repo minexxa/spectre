@@ -145,11 +145,7 @@ async fn handle_tproxy_tcp(
         return hijack_dns_tcp(&mut stream, router).await;
     }
 
-    let decision = if let Some(ref d) = domain {
-        router.match_domain(d)
-    } else {
-        router.match_ip(dest.ip())
-    };
+    let decision = router.match_route(domain.as_deref(), Some(dest.ip()));
     debug!(
         "tproxy tcp {peer} -> {dest} ({:?} via {})",
         decision.outbound, decision.rule
@@ -288,11 +284,7 @@ async fn udp_session_worker(
     }
 
     let domain = sniffed.domain;
-    let decision = if let Some(ref d) = domain {
-        router.match_domain(d)
-    } else {
-        router.match_ip(dest.ip())
-    };
+    let decision = router.match_route(domain.as_deref(), Some(dest.ip()));
     debug!(
         "tproxy udp {peer} -> {dest} ({:?} via {})",
         decision.outbound, decision.rule

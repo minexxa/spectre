@@ -1,6 +1,6 @@
 //! Mixed inbound: HTTP CONNECT + SOCKS4/4a/5 on one port (TCP + UDP ASSOCIATE).
 
-use crate::client::app::router::{Outbound, Router};
+use crate::client::app::router::{Outbound, Router, RouteMatch};
 use crate::client::app::sniffer;
 use crate::client::app::sockopt;
 use crate::config::Config;
@@ -10,10 +10,17 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Sniff window for the mixed inbound (ant: 200ms). Peeking must never hang a
+/// connection whose client sends nothing.
+const PEEK_TIMEOUT: Duration = Duration::from_millis(300);
+/// UDP session idle timeout (aligned with the tproxy inbound).
+const UDP_IDLE: Duration = Duration::from_secs(60);
 
 pub async fn run_mixed(cfg: Arc<Config>, router: Arc<Router>) -> Result<()> {
     let port = cfg.mixed_port.unwrap_or(0);
@@ -195,6 +202,65 @@ async fn handle_http(
     }
 }
 
+/// Sniff the client's first bytes with a timeout. A client that connects but
+/// never sends must not hang the connection forever (ant wraps peek in a
+/// timeout as well).
+async fn peek_sniff(local: &mut TcpStream, router: &Router) -> Option<String> {
+    if !router.sniff_enabled() {
+        return None;
+    }
+    let mut buf = vec![0u8; 2048];
+    let n = match tokio::time::timeout(PEEK_TIMEOUT, local.peek(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        _ => 0,
+    };
+    if n > 0 {
+        sniffer::sniff_tcp_ex(&buf[..n], true, false).domain
+    } else {
+        None
+    }
+}
+
+/// Route + resolve a mixed-inbound TCP target the ant way: the sniffed (or
+/// client-supplied) domain **and** the destination IP are both offered to the
+/// rules — domain first, IP second — so a known domain no longer bypasses IP
+/// rulesets. Domain-form targets are resolved up-front (bootstrap-first) so IP
+/// rulesets can match them, mirroring ant's `resolve_or_ip` + `target::decide`.
+async fn decide_mixed_tcp(
+    local: &mut TcpStream,
+    target: &Target,
+    router: &Arc<Router>,
+) -> Result<MixedDecision> {
+    let sniffed = peek_sniff(local, router).await;
+    let domain = sniffed.clone().or_else(|| match target {
+        Target::Domain { host, .. } => Some(host.clone()),
+        Target::Addr(_) => None,
+    });
+    let resolved: Option<SocketAddr> = match target {
+        Target::Addr(a) => Some(*a),
+        Target::Domain { host, port } => {
+            crate::client::dns::resolve_host_via_bootstrap(host, *port)
+                .await
+                .ok()
+        }
+    };
+    let route = router.match_route(domain.as_deref(), resolved.map(|a| a.ip()));
+    Ok(MixedDecision {
+        route,
+        sniffed,
+        resolved,
+    })
+}
+
+struct MixedDecision {
+    route: RouteMatch,
+    /// Domain recovered from the client stream (TLS SNI / HTTP Host).
+    sniffed: Option<String>,
+    /// Address to dial for Direct (fake-ip aware; None only when a domain-form
+    /// target could not be resolved).
+    resolved: Option<SocketAddr>,
+}
+
 async fn http_absolute_proxy(
     local: &mut TcpStream,
     target: Target,
@@ -203,38 +269,29 @@ async fn http_absolute_proxy(
     head: Vec<u8>,
     body: Vec<u8>,
 ) -> Result<()> {
-    let mut head_buf = [0u8; 1024];
-    let n = local.peek(&mut head_buf).await.unwrap_or(0);
-    let sniff = if n > 0 && router.sniff_enabled() {
-        sniffer::sniff_tcp_ex(&head_buf[..n], true, false)
-    } else {
-        sniffer::SniffResult::default()
-    };
-    let domain = sniff.domain.clone().or_else(|| match &target {
-        Target::Domain { host, .. } => Some(host.clone()),
-        Target::Addr(_) => None,
-    });
-    let decision = if let Some(ref d) = domain {
-        router.match_domain(d)
-    } else if let Target::Addr(a) = &target {
-        router.match_ip(a.ip())
-    } else {
-        router.match_domain("")
-    };
+    let decided = decide_mixed_tcp(local, &target, &router).await?;
     debug!(
         "mixed http {} -> {:?} via {}",
         target.display(),
-        decision.outbound,
-        decision.rule
+        decided.route.outbound,
+        decided.route.rule
     );
-    match decision.outbound {
+    match decided.route.outbound {
         Outbound::Direct => {
-            let mut remote = match &target {
-                Target::Addr(a) => TcpStream::connect(a).await?,
-                Target::Domain { host, port } => {
-                    TcpStream::connect((host.as_str(), *port)).await?
+            let remote_addr = match &target {
+                Target::Addr(a) => {
+                    crate::client::inbound::target::resolve_direct(
+                        &router,
+                        *a,
+                        decided.sniffed.as_deref(),
+                    )
+                    .await?
                 }
+                Target::Domain { .. } => decided
+                    .resolved
+                    .with_context(|| format!("cannot resolve {}", target.display()))?,
             };
+            let mut remote = TcpStream::connect(remote_addr).await?;
             remote.write_all(&head).await?;
             if !body.is_empty() {
                 remote.write_all(&body).await?;
@@ -351,46 +408,29 @@ async fn dispatch_tcp(
     router: Arc<Router>,
     cfg: Arc<Config>,
 ) -> Result<()> {
-    let mut head = [0u8; 1024];
-    let n = local.peek(&mut head).await.unwrap_or(0);
-    let sniff = if n > 0 && router.sniff_enabled() {
-        sniffer::sniff_tcp_ex(&head[..n], true, false)
-    } else {
-        sniffer::SniffResult::default()
-    };
-    let domain = sniff.domain.clone().or_else(|| match &target {
-        Target::Domain { host, .. } => Some(host.clone()),
-        Target::Addr(_) => None,
-    });
-    let decision = if let Some(ref d) = domain {
-        router.match_domain(d)
-    } else if let Target::Addr(a) = &target {
-        router.match_ip(a.ip())
-    } else {
-        router.match_domain("")
-    };
+    let decided = decide_mixed_tcp(local, &target, &router).await?;
     debug!(
         "mixed {} -> {:?} via {}",
         target.display(),
-        decision.outbound,
-        decision.rule
+        decided.route.outbound,
+        decided.route.rule
     );
-    match decision.outbound {
+    match decided.route.outbound {
         Outbound::Direct => {
-            let remote = match &target {
+            let remote_addr = match &target {
                 Target::Addr(a) => {
-                    let real = crate::client::inbound::target::resolve_direct(
+                    crate::client::inbound::target::resolve_direct(
                         &router,
                         *a,
-                        domain.as_deref(),
+                        decided.sniffed.as_deref(),
                     )
-                    .await?;
-                    TcpStream::connect(real).await?
+                    .await?
                 }
-                Target::Domain { host, port } => {
-                    TcpStream::connect((host.as_str(), *port)).await?
-                }
+                Target::Domain { .. } => decided
+                    .resolved
+                    .with_context(|| format!("cannot resolve {}", target.display()))?,
             };
+            let remote = TcpStream::connect(remote_addr).await?;
             let (mut lr, mut lw) = tokio::io::split(local);
             let (mut rr, mut rw) = remote.into_split();
             tokio::select! {
@@ -465,13 +505,41 @@ fn encode_socks5_udp_reply(src: &SocketAddr, data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// One UDP flow per (client, destination) — mirrors the tproxy NAT keying.
+#[derive(Clone)]
+enum ClientSess {
+    /// Direct: a bound socket plus the destination resolved from the first
+    /// packet (fake-ip aware).
+    Direct {
+        sock: Arc<UdpSocket>,
+        dst: SocketAddr,
+    },
+    /// Proxy: a Spectre UDP session id plus the address the flow was opened
+    /// with (domain preferred, so the server resolves the real host).
+    Proxy { sid: u32, addr: Address },
+}
+
+fn udp_session_key(target: &Target) -> String {
+    match target {
+        Target::Addr(a) => a.to_string(),
+        Target::Domain { host, port } => {
+            format!("{}:{}", host.to_ascii_lowercase(), port)
+        }
+    }
+}
+
 async fn socks5_udp_relay(
     udp: Arc<UdpSocket>,
     router: Arc<Router>,
     cfg: Arc<Config>,
 ) -> Result<()> {
-    // client SocketAddr → Spectre session id (if proxy)
-    let sessions: Arc<Mutex<HashMap<SocketAddr, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    // (client, destination) → session. Routing and dialing are decided once
+    // from the first packet of a flow — the packet that carries the QUIC
+    // Initial / SNI — and the session is reused afterwards, exactly like the
+    // tproxy UDP session worker. Re-deciding per packet would flip routes
+    // mid-flow (later QUIC packets carry no SNI).
+    let sessions: Arc<Mutex<HashMap<(SocketAddr, String), ClientSess>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; 65535];
 
     loop {
@@ -488,6 +556,24 @@ async fn socks5_udp_relay(
             continue;
         }
         let payload = pkt[off..n].to_vec();
+        let key = (client, udp_session_key(&target));
+
+        // Fast path: an existing flow keeps its first-packet decision.
+        let existing = { sessions.lock().await.get(&key).cloned() };
+        match existing {
+            Some(ClientSess::Direct { sock, dst }) => {
+                let _ = sock.send_to(&payload, dst).await;
+                continue;
+            }
+            Some(ClientSess::Proxy { sid, addr }) => {
+                if let Err(e) = crate::client::spectre_udp_send(&cfg, sid, &addr, &payload).await
+                {
+                    debug!("spectre udp send: {e:#}");
+                }
+                continue;
+            }
+            None => {}
+        }
 
         let sniff = if router.sniff_enabled() {
             sniffer::sniff_udp_ex(&payload, true, false)
@@ -498,25 +584,49 @@ async fn socks5_udp_relay(
             Target::Domain { host, .. } => Some(host.clone()),
             _ => None,
         });
-        let decision = if let Some(ref d) = domain {
-            router.match_domain(d)
-        } else if let Target::Addr(a) = &target {
-            router.match_ip(a.ip())
-        } else {
-            router.match_domain("")
+        // Both the domain and the destination IP are offered to the rules
+        // (domain first, IP second); fake-IPs route by their mapped domain and
+        // never hit IP rulesets.
+        let dst_ip = match &target {
+            Target::Addr(a) => Some(a.ip()),
+            Target::Domain { .. } => None,
         };
+        let decision = router.match_route(domain.as_deref(), dst_ip);
+        debug!(
+            "socks5 udp {client} -> {} ({:?} via {})",
+            target.display(),
+            decision.outbound,
+            decision.rule
+        );
 
         match decision.outbound {
             Outbound::Direct => {
                 let dst = match &target {
-                    Target::Addr(a) => *a,
+                    Target::Addr(a) => {
+                        // fake-ip aware: reverse-lookup + bootstrap resolve
+                        // (ant `target::decide`), so we never dial the fake
+                        // range.
+                        match crate::client::inbound::target::resolve_direct(
+                            &router,
+                            *a,
+                            domain.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(d) => d,
+                            Err(e) => {
+                                debug!("socks5 udp direct resolve: {e:#}");
+                                continue;
+                            }
+                        }
+                    }
                     Target::Domain { host, port } => {
-                        match tokio::net::lookup_host((host.as_str(), *port)).await {
-                            Ok(mut it) => match it.next() {
-                                Some(a) => a,
-                                None => continue,
-                            },
-                            Err(_) => continue,
+                        match crate::client::dns::resolve_host_via_bootstrap(host, *port).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                debug!("socks5 udp resolve {host}: {e:#}");
+                                continue;
+                            }
                         }
                     }
                 };
@@ -525,70 +635,113 @@ async fn socks5_udp_relay(
                 } else {
                     "[::]:0"
                 };
-                if let Ok(sock) = UdpSocket::bind(bind).await {
-                    if sock.send_to(&payload, dst).await.is_ok() {
-                        let mut rbuf = vec![0u8; 65535];
-                        if let Ok(Ok((rn, src))) = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            sock.recv_from(&mut rbuf),
-                        )
-                        .await
-                        {
-                            let reply = encode_socks5_udp_reply(&src, &rbuf[..rn]);
-                            let _ = udp.send_to(&reply, client).await;
+                let sock = match UdpSocket::bind(bind).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        debug!("socks5 udp direct bind: {e:#}");
+                        continue;
+                    }
+                };
+                // Replies are forwarded by a dedicated task; the relay loop
+                // never blocks on a slow destination.
+                let sock2 = sock.clone();
+                let udp2 = udp.clone();
+                let sessions2 = sessions.clone();
+                let key2 = key.clone();
+                tokio::spawn(async move {
+                    let mut rbuf = vec![0u8; 65535];
+                    loop {
+                        match tokio::time::timeout(UDP_IDLE, sock2.recv_from(&mut rbuf)).await {
+                            Ok(Ok((rn, src))) => {
+                                let reply = encode_socks5_udp_reply(&src, &rbuf[..rn]);
+                                if udp2.send_to(&reply, client).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
                         }
                     }
-                }
+                    sessions2.lock().await.remove(&key2);
+                });
+                sessions
+                    .lock()
+                    .await
+                    .insert(key, ClientSess::Direct { sock: sock.clone(), dst });
+                let _ = sock.send_to(&payload, dst).await;
             }
             Outbound::Proxy => {
-                let addr = match &target {
-                    Target::Domain { host, port } => Address::new(host.clone(), *port),
-                    Target::Addr(a) => Address::new(a.ip().to_string(), a.port()),
-                };
-                let mut map = sessions.lock().await;
-                let sid = if let Some(&s) = map.get(&client) {
-                    s
-                } else {
-                    match crate::client::spectre_udp_session(&cfg, &addr).await {
-                        Ok((s, mut rx)) => {
-                            map.insert(client, s);
-                            let udp2 = udp.clone();
-                            let sessions2 = sessions.clone();
-                            tokio::spawn(async move {
-                                while let Some((src_addr, data)) = rx.recv().await {
-                                    let src = match format!(
-                                        "{}:{}",
-                                        src_addr.host, src_addr.port
-                                    )
-                                    .parse::<SocketAddr>()
-                                    {
-                                        Ok(a) => a,
-                                        Err(_) => SocketAddr::new(
-                                            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                                            src_addr.port,
-                                        ),
-                                    };
-                                    let reply = encode_socks5_udp_reply(&src, &data);
-                                    let _ = udp2.send_to(&reply, client).await;
+                let addr = proxy_udp_addr(&router, &target, domain.as_deref());
+                match crate::client::spectre_udp_session(&cfg, &addr).await {
+                    Ok((sid, mut rx)) => {
+                        let udp2 = udp.clone();
+                        let sessions2 = sessions.clone();
+                        let key2 = key.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match tokio::time::timeout(UDP_IDLE, rx.recv()).await {
+                                    Ok(Some((src_addr, data))) => {
+                                        let src = match format!(
+                                            "{}:{}",
+                                            src_addr.host, src_addr.port
+                                        )
+                                        .parse::<SocketAddr>()
+                                        {
+                                            Ok(a) => a,
+                                            Err(_) => SocketAddr::new(
+                                                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                                                src_addr.port,
+                                            ),
+                                        };
+                                        let reply = encode_socks5_udp_reply(&src, &data);
+                                        if udp2.send_to(&reply, client).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    _ => break,
                                 }
-                                sessions2.lock().await.remove(&client);
-                                crate::client::spectre_udp_close_session(s);
-                            });
-                            s
-                        }
-                        Err(e) => {
-                            debug!("spectre udp session: {e:#}");
-                            continue;
+                            }
+                            sessions2.lock().await.remove(&key2);
+                            crate::client::spectre_udp_close_session(sid);
+                        });
+                        sessions.lock().await.insert(
+                            key,
+                            ClientSess::Proxy {
+                                sid,
+                                addr: addr.clone(),
+                            },
+                        );
+                        if let Err(e) =
+                            crate::client::spectre_udp_send(&cfg, sid, &addr, &payload).await
+                        {
+                            debug!("spectre udp send: {e:#}");
                         }
                     }
-                };
-                drop(map);
-                if let Err(e) = crate::client::spectre_udp_send(&cfg, sid, &addr, &payload).await
-                {
-                    debug!("spectre udp send: {e:#}");
+                    Err(e) => {
+                        debug!("spectre udp session: {e:#}");
+                    }
                 }
             }
         }
+    }
+}
+
+/// Destination Address for a proxied UDP packet: prefer the domain (sniffed /
+/// client-supplied / fake-ip reverse) so the server resolves the real host
+/// instead of dialing a fake range.
+fn proxy_udp_addr(router: &Router, target: &Target, sniffed: Option<&str>) -> Address {
+    let port = target.port();
+    let host = sniffed
+        .map(|s| s.to_string())
+        .or_else(|| match target {
+            Target::Domain { host, .. } => Some(host.clone()),
+            Target::Addr(a) => router.domain_for_fakeip(a.ip()),
+        });
+    match host {
+        Some(h) => Address::new(h, port),
+        None => match target {
+            Target::Addr(a) => Address::new(a.ip().to_string(), port),
+            Target::Domain { host, .. } => Address::new(host.clone(), port),
+        },
     }
 }
 
