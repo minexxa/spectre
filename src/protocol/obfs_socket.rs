@@ -102,9 +102,9 @@ impl Runtime for ObfsRuntime {
         self.inner.spawn(future)
     }
 
-    fn wrap_udp_socket(&self, t: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+    fn wrap_udp_socket(&self, t: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
         let inner = self.inner.wrap_udp_socket(t)?;
-        Ok(Arc::new(ObfsUdpSocket {
+        Ok(Box::new(ObfsUdpSocket {
             inner,
             psk: self.psk.clone(),
         }))
@@ -116,7 +116,10 @@ impl Runtime for ObfsRuntime {
 }
 
 struct ObfsUdpSocket {
-    inner: Arc<dyn AsyncUdpSocket>,
+    // `Box`, not `Arc`: `Runtime::wrap_udp_socket` returns `Box<dyn
+    // AsyncUdpSocket>` in this version of quinn-jls (confirmed by compiler
+    // error, not just inferred from a sibling fork this time).
+    inner: Box<dyn AsyncUdpSocket>,
     psk: Arc<Vec<u8>>,
 }
 
@@ -135,7 +138,7 @@ impl AsyncUdpSocket for ObfsUdpSocket {
     }
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut Context,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
