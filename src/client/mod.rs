@@ -32,6 +32,12 @@ pub struct ClientConfigYaml {
     pub tx_bps: u64,
     /// Optional local UDP listen for datagram proxying (e.g. 127.0.0.1:1081)
     pub udp_listen: Option<SocketAddr>,
+    /// Optional Salamander-style outer packet obfuscation PSK (see
+    /// `protocol::obfs`/`protocol::obfs_socket`). Must exactly match the
+    /// server's `obfs_psk`, and is independent of the JLS `password`. `None`
+    /// disables it (default — unverified against a real compiler, see
+    /// `obfs_socket.rs` doc comment before enabling in production).
+    pub obfs_psk: Option<Vec<u8>>,
 }
 
 pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
@@ -43,7 +49,15 @@ pub async fn run_client(cfg: ClientConfigYaml) -> Result<()> {
         "0.0.0.0:0".parse()?
     };
     let socket = bind_udp(bind_addr).context("bind udp socket")?;
-    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
+    let base_runtime =
+        quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime found"))?;
+    let runtime: Arc<dyn quinn::Runtime> = match &cfg.obfs_psk {
+        Some(psk) => Arc::new(crate::protocol::obfs_socket::ObfsRuntime::new(
+            base_runtime,
+            psk.clone(),
+        )),
+        None => base_runtime,
+    };
     let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
     endpoint.set_default_client_config(configure_client(&cfg)?);
 
@@ -556,6 +570,11 @@ async fn get_or_connect(cfg: &Config) -> Result<quinn::Connection> {
         rx_bps: cfg.rx_bps()?,
         tx_bps: cfg.tx_bps()?,
         udp_listen: None,
+        // TODO: this path builds its own `endpoint` above (not through
+        // `run_client`), so it doesn't yet read an `obfs-psk` YAML field or
+        // apply `ObfsRuntime`. Wire both together if/when `config.rs` grows
+        // that field — `run_client` already shows the pattern.
+        obfs_psk: None,
     };
     endpoint.set_default_client_config(configure_client(&client_cfg)?);
     info!("connecting to {} (SNI={})", server, cfg.server_name());
