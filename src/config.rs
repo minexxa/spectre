@@ -381,6 +381,9 @@ pub enum RouteEntry {
 pub enum OutboundKind {
     Direct,
     Proxy, // Spectre
+    /// Reject the connection (ant `block` / `reject`); DNS answers NOERROR
+    /// empty (rcode://success) for domains routed here.
+    Block,
 }
 
 impl OutboundKind {
@@ -388,7 +391,8 @@ impl OutboundKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "direct" => Ok(Self::Direct),
             "proxy" | "spectre" => Ok(Self::Proxy),
-            other => bail!("unknown outbound `{other}`; use direct or proxy"),
+            "block" | "reject" => Ok(Self::Block),
+            other => bail!("unknown outbound `{other}`; use direct, proxy or block"),
         }
     }
 }
@@ -416,7 +420,7 @@ pub fn parse_routes(routes: &[String]) -> Result<Vec<RouteEntry>> {
         out.push(RouteEntry::parse(r)?);
     }
     if !matches!(out.last(), Some(RouteEntry::Match(_))) {
-        bail!("route list must end with a final MATCH (`direct` or `proxy`)");
+        bail!("route list must end with a final MATCH (`direct`, `proxy` or `block`)");
     }
     Ok(out)
 }
