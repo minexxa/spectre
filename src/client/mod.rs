@@ -475,6 +475,10 @@ pub async fn run_client_from_config(cfg: crate::config::Config) -> Result<()> {
 
     let entries = parse_routes(&cfg.route)?;
     let router = Arc::new(build_router(&cfg, entries)?);
+    // Register the bootstrap nameserver (default-nameserver → direct-nameserver
+    // fallback) before any dialing: proxy node domains and DoT/DoH upstream
+    // domains resolve through it first. Memory-only, no network IO.
+    crate::client::dns::register_bootstrap(&cfg);
     if cfg.dns_enabled() {
         crate::client::dns::init_engine(&cfg)?;
     }
@@ -552,7 +556,7 @@ async fn get_or_connect(cfg: &Config) -> Result<quinn::Connection> {
             return Ok(c.clone());
         }
     }
-    let server = cfg.client_server()?;
+    let server = cfg.client_server().await?;
     let bind_addr: SocketAddr = if server.is_ipv6() {
         "[::]:0".parse()?
     } else {
