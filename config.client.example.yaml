@@ -9,6 +9,7 @@ mixed-port: 1080
 sniff: true
 
 proxy:
+  # server may be an IP or a domain (resolved via dns.default-nameserver)
   server: 1.2.3.4
   port: 4433
   sni: www.cloudflare.com
@@ -21,6 +22,11 @@ dns:
   port: 5353
   mode: fakeip                 # redir-host | fakeip
   route-hijack: true
+  # Bootstrap nameserver: resolves proxy.server domains and DoT/DoH upstream
+  # domains. Must be a pure-IP udp/tcp nameserver (it cannot itself depend on
+  # any resolution). Optional — falls back to direct-nameserver when that is
+  # a pure-IP udp/tcp upstream.
+  default-nameserver: 223.5.5.5
   # Schemes: udp (default) | tcp | tls (DoT) | https (DoH)
   #   223.5.5.5
   #   udp://1.1.1.1:53
