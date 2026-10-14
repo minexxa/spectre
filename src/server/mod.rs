@@ -287,6 +287,21 @@ async fn handle_proxy_stream(
             }
             let _ = send.finish();
         }
+        Command::Padding => {
+            // Client-side keepalive/cover traffic (see
+            // `client::spawn_padding_keepalive`). Just drain and discard the
+            // frame; no response content is required, but we still send a
+            // small random-length padding reply so the stream isn't
+            // trivially distinguishable (by size/direction) from a real
+            // short request/response exchange.
+            let mut rest = vec![0u8; 1024];
+            let n: usize = recv.read(&mut rest).await?.unwrap_or_default();
+            let mut buf = BytesMut::from(&rest[..n]);
+            let _ = PaddingFrame::decode(&mut buf);
+            let reply = PaddingFrame::random();
+            let _ = send.write_all(&reply.encode()).await;
+            let _ = send.finish();
+        }
         _ => {
             warn!("unsupported command {cmd:?}");
             let _ = send.finish();
