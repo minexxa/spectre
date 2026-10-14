@@ -1,6 +1,7 @@
 //! Spectre shared protocol core (wire format, congestion, relay, UDP framing).
 
 pub mod brutal;
+pub mod obfs;
 pub mod relay;
 pub mod udp;
 
@@ -139,7 +140,7 @@ impl TcpConnectResponse {
         Self {
             ok: true,
             message: String::new(),
-            padding: random_padding(16..64),
+            padding: random_padding(TCP_RESPONSE_PADDING),
         }
     }
 
@@ -147,7 +148,7 @@ impl TcpConnectResponse {
         Self {
             ok: false,
             message: msg.into(),
-            padding: random_padding(16..64),
+            padding: random_padding(TCP_RESPONSE_PADDING),
         }
     }
 
@@ -305,7 +306,7 @@ impl AuthResponse {
             rx_bps,
             tx_bps,
             message: String::new(),
-            padding: random_padding(16..64),
+            padding: random_padding(AUTH_PADDING),
         }
     }
 
@@ -315,7 +316,7 @@ impl AuthResponse {
             rx_bps: 0,
             tx_bps: 0,
             message: msg.into(),
-            padding: random_padding(16..64),
+            padding: random_padding(AUTH_PADDING),
         }
     }
 
@@ -414,6 +415,79 @@ pub fn random_padding(range: std::ops::Range<usize>) -> Vec<u8> {
     let mut v = vec![0u8; len];
     rng.fill_bytes(&mut v);
     v
+}
+
+// ── padding size tiers ──────────────────────────────────────────────────────
+//
+// A flat, narrow padding range (e.g. 16..64 everywhere) is itself a usable
+// statistical feature: every Spectre control message ends up clustered in
+// the same few dozen bytes, which stands out against ordinary HTTPS/H3
+// traffic where control-ish messages vary a lot more in size. Hysteria2
+// instead uses different, wider ranges per message type (see
+// `core/internal/protocol/padding.go`: auth 256..2048, tcp request 64..512,
+// tcp response 128..1024). We follow the same idea here: AUTH happens once
+// per connection so its extra bytes are cheap, while per-stream TCP_CONNECT
+// messages stay smaller so padding doesn't meaningfully hurt short-flow
+// latency.
+pub const AUTH_PADDING: std::ops::Range<usize> = 128..1024;
+pub const TCP_REQUEST_PADDING: std::ops::Range<usize> = 24..256;
+pub const TCP_RESPONSE_PADDING: std::ops::Range<usize> = 32..384;
+/// Padding used for the application-layer keepalive (see [`PaddingFrame`]).
+pub const KEEPALIVE_PADDING: std::ops::Range<usize> = 16..512;
+
+/// A pure padding / keep-alive frame (`Command::Padding`, 0xFF in
+/// PROTOCOL.md). Sent on its own short-lived bidirectional stream at a
+/// jittered interval (see `client::spawn_padding_keepalive`) so that a
+/// passive observer sees irregularly sized, irregularly timed "heartbeat"
+/// streams instead of a perfectly periodic QUIC PING — a fixed-interval
+/// keepalive is itself a recognizable timing fingerprint.
+#[derive(Debug)]
+pub struct PaddingFrame {
+    pub padding: Vec<u8>,
+}
+
+impl PaddingFrame {
+    /// Build a frame with a random length drawn from `KEEPALIVE_PADDING`.
+    pub fn random() -> Self {
+        Self {
+            padding: random_padding(KEEPALIVE_PADDING),
+        }
+    }
+
+    pub fn encode(&self) -> BytesMut {
+        let mut buf = BytesMut::new();
+        buf.put_u8(Command::Padding as u8);
+        buf.put_u16(self.padding.len() as u16);
+        buf.put_slice(&self.padding);
+        buf
+    }
+
+    pub fn decode(buf: &mut impl Buf) -> Result<Self, ProtocolError> {
+        // cmd already consumed
+        if buf.remaining() < 2 {
+            return Err(ProtocolError::BufferTooShort);
+        }
+        let len = buf.get_u16() as usize;
+        if buf.remaining() < len {
+            return Err(ProtocolError::BufferTooShort);
+        }
+        let mut padding = vec![0u8; len];
+        buf.copy_to_slice(&mut padding);
+        Ok(Self { padding })
+    }
+}
+
+/// Jittered keep-alive interval: `base` plus up to `jitter_frac` of `base`
+/// as uniform random jitter, so consecutive intervals are not identical.
+/// Mirrors the kind of timing randomization Hysteria's obfuscation layer
+/// and ShadowQUIC's masquerade fallback rely on elsewhere in the handshake —
+/// applied here to the one place Spectre previously had a perfectly regular
+/// timer (the idle keepalive).
+pub fn jittered_interval(base: std::time::Duration, jitter_frac: f64) -> std::time::Duration {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let jitter = rng.gen_range(0.0..jitter_frac.max(0.0));
+    base.mul_f64(1.0 + jitter)
 }
 
 /// Simple constant-time-ish password compare
